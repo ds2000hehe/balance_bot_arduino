@@ -101,7 +101,7 @@ const float COUNTS_PER_REV = 6.0f * POLE_PAIRS;
 // Wheel speed at full duty (100 % throttle PWM) with your battery [rad/s]. Used as the feed-forward (step 2).
 // Hoverboard hub motors turn about 16 RPM per volt with no load: roughly 1.7 x battery volts in rad/s
 // (36 V -> 60 rad/s).
-const float MOTOR_MAX_RAD_S = 60.0f;
+const float MOTOR_MAX_RAD_S = 68.0f;  // measured with motor_test.py speed: left 69.8, right 66.7
 
 // The policy was trained for wheel speeds up to 30 rad/s (WHEEL_MAX_SPEED in the Isaac Lab package).
 const float MAX_TARGET_RAD_S = 30.0f;

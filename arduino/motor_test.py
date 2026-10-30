@@ -7,6 +7,7 @@ Wheels off the ground, drivers powered (36 V), sketch flashed, Arduino IDE's Ser
     python3 arduino/motor_test.py speed  /dev/ttyUSB0    # spins the wheels at 20 % and 40 % throttle
     python3 arduino/motor_test.py run    /dev/ttyUSB0 --duty 0.02 --seconds 1 --wheel left
                                                          # fixed throttle (here 2 %) for a while, prints the speed
+    python3 arduino/motor_test.py loop   /dev/ttyUSB0    # speed loop: targets 5, 15, -5, 0 rad/s, target vs measured
 
 Needs pyserial (sudo apt install python3-serial). Ctrl-C stops (the motors switch off).
 """
@@ -146,13 +147,50 @@ def run_test(ser: serial.Serial, duty: float, seconds: float, wheel: str):
           + ("   (0 = didn't turn, or no speed pulses: try a bit more --duty)" if max(peak) == 0 else ""))
 
 
+def loop_test(ser: serial.Serial, targets: list[float], seconds: float):
+    print(f"Speed loop: targets {', '.join(f'{t:g}' for t in targets)} rad/s, {seconds} s each, both wheels.")
+    print("Wheels off the ground! A good loop reaches the target within ~0.3 s and holds it without buzzing.")
+    input("Press Enter to start (Ctrl-C stops) ")
+    reader = lines(ser)
+    summary = []
+    for target in targets:
+        t0 = last_print = time.time()
+        samples = []
+        while time.time() - t0 < seconds:
+            ser.write(f"V {target:.3f} {target:.3f}\n".encode())  # resent every 20 ms like the ROS bridge
+            t_send = time.time()
+            while time.time() - t_send < 0.02:
+                line = next(reader)
+                m = line and re.match(r"W (-?[\d.]+) (-?[\d.]+)", line)
+                if not m:
+                    continue
+                w = (float(m.group(1)), float(m.group(2)))
+                if time.time() - t0 > seconds / 2:
+                    samples.append(w)
+                if time.time() - last_print >= 0.2:
+                    print(f"  target {target:+6.1f}   t {time.time() - t0:3.1f} s   left {w[0]:+6.2f}   right {w[1]:+6.2f}")
+                    last_print = time.time()
+        if samples:
+            n = len(samples)
+            mean = [sum(x[i] for x in samples) / n for i in range(2)]
+            spread = [max(x[i] for x in samples) - min(x[i] for x in samples) for i in range(2)]
+            summary.append((target, mean, spread))
+    ser.write(b"S\n")
+    print("\nSecond half of each step (mean, max-min):")
+    for target, mean, spread in summary:
+        print(f"  target {target:+6.1f}:  left {mean[0]:+6.2f} ({spread[0]:.1f})   right {mean[1]:+6.2f} ({spread[1]:.1f})")
+    print("Means within ~10 % of the target (0 at 0) and small spread = good. Way off or wildly swinging: tell Claude.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("test", choices=("counts", "speed", "run"))
+    ap.add_argument("test", choices=("counts", "speed", "run", "loop"))
     ap.add_argument("port", help="e.g. /dev/ttyUSB0 or /dev/ttyACM0")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--duty", type=float, default=0.02, help="run: throttle fraction, 0.02 = 2 %%, negative = backward")
     ap.add_argument("--seconds", type=float, default=1.0, help="run: how long (default 1 s)")
+    ap.add_argument("--targets", type=float, nargs="+", default=[5, 15, -5, 0], help="loop: speeds in rad/s")
+    ap.add_argument("--step-seconds", type=float, default=2.0, help="loop: seconds per target")
     ap.add_argument("--wheel", choices=("left", "right", "both"), default="both", help="run: which wheel")
     args = ap.parse_args()
     ser = open_port(args.port, args.baud)
@@ -161,8 +199,10 @@ def main():
             counts_test(ser)
         elif args.test == "speed":
             speed_test(ser)
-        else:
+        elif args.test == "run":
             run_test(ser, args.duty, args.seconds, args.wheel)
+        else:
+            loop_test(ser, args.targets, args.step_seconds)
     except KeyboardInterrupt:
         print()
     finally:
