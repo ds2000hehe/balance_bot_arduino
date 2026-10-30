@@ -18,8 +18,7 @@
 // commands must keep coming (the ROS bridge sends 50 per second): after CMD_TIMEOUT_MS without one, the outputs
 // switch off.
 //
-// Wiring (Uno / Nano pin names; on an Arduino Mega 2560 the throttles go to D11 (right) / D12 (left) instead of
-// D9 / D10, everything else is the same)
+// Wiring (same pins on Uno / Nano and Arduino Mega 2560)
 //
 //   ZS-X11H signal header: PWM throttle, speed pulse out (SC), GND, GND, 5V out
 //
@@ -61,18 +60,19 @@
 // Pins. The speed outputs must stay on D9 / D10 (Timer1); DIR can be any free digital pin.
 const uint8_t RIGHT_DIR_PIN = 6;
 const uint8_t LEFT_DIR_PIN = 7;
-// right speed = OC1A, left speed = OC1B: fixed, see setupPwm(). The board is detected when compiling:
-//   ATmega328P (Uno / Nano / bare 328P boards): OC1A = D9,  OC1B = D10
-//   ATmega2560 (Arduino Mega 2560):             OC1A = D11, OC1B = D12
+// Throttle: right = D9, left = D10 on both supported boards (fixed, see setupPwm()). The chip is detected when
+// compiling (pick the board in the IDE / --fqbn):
+//   ATmega328P (Uno / Nano):       D9 / D10 = Timer1 OC1A / OC1B, 10-bit PWM
+//   ATmega2560 (Arduino Mega 2560): D9 / D10 = Timer2 OC2B / OC2A, 8-bit PWM, dithered to 10 bits (TIMER2_OVF)
 #if defined(__AVR_ATmega2560__) || defined(__AVR_ATmega1280__)
-const uint8_t RIGHT_PWM_PIN = 11;
-const uint8_t LEFT_PWM_PIN = 12;
+#define BOARD_MEGA 1
 #elif defined(__AVR_ATmega328P__) || defined(__AVR_ATmega328__) || defined(__AVR_ATmega168__)
-const uint8_t RIGHT_PWM_PIN = 9;
-const uint8_t LEFT_PWM_PIN = 10;
+#define BOARD_MEGA 0
 #else
 #error "unsupported board: pick Arduino Uno / Nano (ATmega328P) or Arduino Mega 2560"
 #endif
+const uint8_t RIGHT_PWM_PIN = 9;
+const uint8_t LEFT_PWM_PIN = 10;
 
 // Flip these so that a positive target drives the robot forward and is measured as positive (see setup above).
 // The motors are mirrored on a two-wheeled robot, so usually exactly one of the two MOTOR_INVERTs is true.
@@ -117,6 +117,16 @@ float KI = 0.2f;   // duty per rad of accumulated error
 // (what the policy is trained with); wheel_check measures the dead zone.
 const float MIN_DUTY = 0.0f;
 
+// Output protection (the ZS-X11H trips its over-current protection, or the battery's BMS, on hard reversals and
+// throttle steps: violent vibration, then everything cuts out):
+//   * the throttle rises by at most DUTY_SLEW_PER_S per second (falling is not limited: less throttle is safe)
+//   * DIR only changes with the throttle at zero, the wheel slower than REVERSE_MAX_RAD_S, and at least
+//     DIR_MIN_HOLD_MS after the last change (no chattering when the speed loop hovers around zero)
+// The wheel coasts (throttle 0) while a reversal waits.
+const float DUTY_SLEW_PER_S = 4.0f;     // 0 -> 100 % in 0.25 s, 0 -> 30 % in 75 ms
+const float REVERSE_MAX_RAD_S = 3.0f;   // ~0.25 m/s at the tyre
+const uint32_t DIR_MIN_HOLD_MS = 30;
+
 // Throttle PWM frequency: 0 = 15.6 kHz (default), 1 = 1.95 kHz. Both 10-bit. ZS-X11H boards are usually specified
 // for ~1-20 kHz; if the motor does not respond smoothly to "D 0.1 0.1" .. "D 0.5 0.5", try the other one.
 #define PWM_SLOW 0
@@ -130,13 +140,21 @@ const uint32_t CMD_TIMEOUT_MS = 200;      // no "V" / "D" command for this long 
 
 // ------------------------------------------------------------------------------------------------------------
 
-const uint16_t PWM_TOP = 1023;  // Timer1 fast PWM, TOP = ICR1: 10 bits
+const uint16_t PWM_TOP = 1023;  // throttle resolution: 10 bits (Timer1 TOP = ICR1; Mega: 8 bits + 2 dithered)
+
+#if BOARD_MEGA
+typedef volatile uint8_t PwmReg;
+#define PWM_TCCRA TCCR2A
+#else
+typedef volatile uint16_t PwmReg;
+#define PWM_TCCRA TCCR1A
+#endif
 
 struct Wheel {
   const char* name;
   uint8_t dirPin;
-  volatile uint16_t* ocr;  // Timer1 compare register of this wheel's speed output
-  uint8_t comBit;          // TCCR1A bit that connects the output (COM1A1 / COM1B1)
+  PwmReg* ocr;             // timer compare register of this wheel's throttle output
+  uint8_t comBit;          // TCCRxA bit that connects the output (COM1A1 / COM1B1, Mega: COM2B1 / COM2A1)
   uint8_t pwmPin;
   bool motorInvert, feedbackInvert;
 
@@ -147,6 +165,9 @@ struct Wheel {
   volatile uint32_t hallErrors;
   volatile int8_t pulseSign;  // FEEDBACK_SPEED_PULSE: +1 / -1 = direction the driver is pushing (forward = +1)
 
+  volatile uint16_t pwm10;  // Mega: 10-bit throttle, dithered onto the 8-bit timer by TIMER2_OVF
+  uint8_t ditherAcc;
+
   int32_t prevCount;
   uint32_t prevEdgeUs;
   int8_t lastDir;  // direction of the last counted edge(s): +1, -1, 0 = none yet
@@ -154,10 +175,19 @@ struct Wheel {
   float duty;      // open-loop duty ("D" command)
   float velocity;  // rad/s, forward positive
   float integral;  // rad
+
+  float appliedDuty;    // what actually goes to the driver, after the output protection, [-1, 1]
+  int8_t dirSign;       // direction DIR currently selects: +1 forward, -1 backward
+  uint32_t dirChangeMs; // when DIR last changed
 };
 
+#if BOARD_MEGA
+Wheel leftWheel = {"left", LEFT_DIR_PIN, &OCR2A, COM2A1, LEFT_PWM_PIN, LEFT_MOTOR_INVERT, LEFT_FEEDBACK_INVERT};
+Wheel rightWheel = {"right", RIGHT_DIR_PIN, &OCR2B, COM2B1, RIGHT_PWM_PIN, RIGHT_MOTOR_INVERT, RIGHT_FEEDBACK_INVERT};
+#else
 Wheel leftWheel = {"left", LEFT_DIR_PIN, &OCR1B, COM1B1, LEFT_PWM_PIN, LEFT_MOTOR_INVERT, LEFT_FEEDBACK_INVERT};
 Wheel rightWheel = {"right", RIGHT_DIR_PIN, &OCR1A, COM1A1, RIGHT_PWM_PIN, RIGHT_MOTOR_INVERT, RIGHT_FEEDBACK_INVERT};
+#endif
 Wheel* const wheels[2] = {&leftWheel, &rightWheel};
 
 enum Mode { MODE_OFF, MODE_SPEED, MODE_OPEN_LOOP };
@@ -255,13 +285,37 @@ void updateVelocity(Wheel& w, uint32_t nowUs) {
 
 // ---- motor output ----
 
+#if BOARD_MEGA
+// Spreads the 2 low bits of each wheel's 10-bit throttle over 4 PWM periods (the driver sees the average).
+ISR(TIMER2_OVF_vect) {
+  for (Wheel* w : wheels) {
+    uint16_t v = w->pwm10;
+    uint8_t high = v >> 2;
+    w->ditherAcc += v & 3;
+    if (w->ditherAcc >= 4) {
+      w->ditherAcc -= 4;
+      if (high < 255) high++;
+    }
+    *w->ocr = high;  // double-buffered: takes effect at the next period
+  }
+}
+#endif
+
 void setupPwm() {
-  // Timer1 fast PWM, mode 14 (TOP = ICR1) on OC1A and OC1B: 16 MHz / 1024 = 15.6 kHz without
+#if BOARD_MEGA
+  // Timer2 fast PWM, mode 3 (TOP = 255) on OC2B (D9) and OC2A (D10): 16 MHz / 8 / 256 = 7.8 kHz, / 32 = 1.95 kHz
+  TCCR2A = (1 << WGM21) | (1 << WGM20);
+  TCCR2B = PWM_SLOW ? ((1 << CS21) | (1 << CS20)) : (1 << CS21);
+  OCR2A = OCR2B = 0;
+  TIMSK2 = (1 << TOIE2);
+#else
+  // Timer1 fast PWM, mode 14 (TOP = ICR1) on OC1A (D9) and OC1B (D10): 16 MHz / 1024 = 15.6 kHz without
   // prescaler, / 8 = 1.95 kHz
   TCCR1A = (1 << WGM11);
   TCCR1B = (1 << WGM13) | (1 << WGM12) | (PWM_SLOW ? (1 << CS11) : (1 << CS10));
   ICR1 = PWM_TOP;
   OCR1A = OCR1B = 0;
+#endif
   pinMode(RIGHT_PWM_PIN, OUTPUT);
   pinMode(LEFT_PWM_PIN, OUTPUT);
   digitalWrite(RIGHT_PWM_PIN, LOW);
@@ -271,21 +325,63 @@ void setupPwm() {
 // 0 .. PWM_TOP. Zero disconnects the timer from the pin and holds it low (fast PWM with OCR = 0 still gives a short
 // spike every period).
 void writePwm(Wheel& w, uint16_t value) {
+  if (value > PWM_TOP) value = PWM_TOP;
+#if BOARD_MEGA
+  noInterrupts();  // 16-bit value read by TIMER2_OVF
+  w.pwm10 = value;
+  interrupts();
+#endif
   if (value == 0) {
-    TCCR1A &= ~(1 << w.comBit);
+    PWM_TCCRA &= ~(1 << w.comBit);
     digitalWrite(w.pwmPin, LOW);
   } else {
-    *w.ocr = value > PWM_TOP ? PWM_TOP : value;
-    TCCR1A |= (1 << w.comBit);
+#if !BOARD_MEGA
+    *w.ocr = value;
+#endif
+    PWM_TCCRA |= (1 << w.comBit);
   }
 }
 
-// duty in [-1, 1], positive = forward; the driver handles direction changes at speed by itself
-void driveMotor(Wheel& w, float duty) {
-  bool forward = duty >= 0.0f;
-  digitalWrite(w.dirPin, (forward != w.motorInvert) ? HIGH : LOW);
-  w.pulseSign = forward ? 1 : -1;
-  writePwm(w, (uint16_t)(fabs(duty) * PWM_TOP + 0.5f));
+void setDir(Wheel& w, int8_t sign) {
+  digitalWrite(w.dirPin, ((sign > 0) != w.motorInvert) ? HIGH : LOW);
+  w.dirSign = sign;
+  w.pulseSign = sign;
+  w.dirChangeMs = millis();
+}
+
+void stopMotor(Wheel& w) {
+  w.appliedDuty = 0.0f;
+  writePwm(w, 0);
+}
+
+// duty in [-1, 1], positive = forward, through the output protection (see DUTY_SLEW_PER_S). Returns true when the
+// output had to be held back (the speed loop then stops integrating).
+bool driveMotor(Wheel& w, float duty, float dt) {
+  int8_t want = duty > 0.0f ? 1 : (duty < 0.0f ? -1 : w.dirSign);
+  float magnitude = fabs(duty);
+  bool limited = false;
+  if (want != w.dirSign) {
+    // reversal: coast until the wheel has slowed down, then flip DIR (throttle is already 0 here)
+    bool slow = fabs(w.velocity) < REVERSE_MAX_RAD_S;
+    bool held = millis() - w.dirChangeMs >= DIR_MIN_HOLD_MS;
+    if (slow && held) {
+      writePwm(w, 0);
+      setDir(w, want);
+      w.appliedDuty = 0.0f;
+    } else {
+      stopMotor(w);
+      return true;
+    }
+  }
+  float current = fabs(w.appliedDuty);
+  float maxUp = current + DUTY_SLEW_PER_S * dt;
+  if (magnitude > maxUp) {
+    magnitude = maxUp;
+    limited = true;
+  }
+  w.appliedDuty = w.dirSign * magnitude;
+  writePwm(w, (uint16_t)(magnitude * PWM_TOP + 0.5f));
+  return limited;
 }
 
 // ---- velocity loop ----
@@ -293,12 +389,12 @@ void driveMotor(Wheel& w, float duty) {
 void controlWheel(Wheel& w, float dt) {
   if (mode == MODE_OFF) {
     w.integral = 0.0f;
-    writePwm(w, 0);
+    stopMotor(w);
     return;
   }
   if (mode == MODE_OPEN_LOOP) {
     w.integral = 0.0f;
-    driveMotor(w, w.duty);
+    driveMotor(w, w.duty, dt);
     return;
   }
   float error = w.target - w.velocity;
@@ -307,14 +403,18 @@ void controlWheel(Wheel& w, float dt) {
   duty = constrain(duty, -1.0f, 1.0f);
   // anti-windup: hold the integral while saturated in the direction of the error
   bool saturated = (duty >= 1.0f && error > 0.0f) || (duty <= -1.0f && error < 0.0f);
-  if (!saturated) w.integral += error * dt;
-  driveMotor(w, duty);
+  bool limited = driveMotor(w, duty, dt);
+  if (!saturated && !limited) w.integral += error * dt;
 }
 
 // ---- serial protocol ----
 
 void printConfig() {
-  Serial.println(F("# balance bot ATmega BLDC wheel controller (ZS-X11H, speed D9/D10 + DIR D6/D7)"));
+  Serial.print(F("# balance bot ATmega BLDC wheel controller (ZS-X11H, throttle right D"));
+  Serial.print(RIGHT_PWM_PIN);
+  Serial.print(F(" / left D"));
+  Serial.print(LEFT_PWM_PIN);
+  Serial.println(F(" + DIR D6/D7)"));
   Serial.print(F("# feedback "));
   Serial.print(FEEDBACK == FEEDBACK_HALLS ? F("halls A0-A5") : F("speed pulse D2/D3"));
   Serial.print(F(", "));
@@ -447,6 +547,7 @@ void setup() {
   pinMode(LEFT_DIR_PIN, OUTPUT);
   pinMode(RIGHT_DIR_PIN, OUTPUT);
   setupPwm();
+  for (Wheel* w : wheels) setDir(*w, 1);
   Serial.begin(SERIAL_BAUD);
   setupFeedback();
   printConfig();

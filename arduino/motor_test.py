@@ -5,6 +5,8 @@ Wheels off the ground, drivers powered (36 V), sketch flashed, Arduino IDE's Ser
 
     python3 arduino/motor_test.py counts /dev/ttyUSB0    # turn the wheels by hand, read the pulses per turn
     python3 arduino/motor_test.py speed  /dev/ttyUSB0    # spins the wheels at 20 % and 40 % throttle
+    python3 arduino/motor_test.py run    /dev/ttyUSB0 --duty 0.02 --seconds 1 --wheel left
+                                                         # fixed throttle (here 2 %) for a while, prints the speed
 
 Needs pyserial (sudo apt install python3-serial). Ctrl-C stops (the motors switch off).
 """
@@ -117,15 +119,50 @@ def speed_test(ser: serial.Serial):
     print("far outside that, the drive model needs updating and the policy retraining.")
 
 
+def run_test(ser: serial.Serial, duty: float, seconds: float, wheel: str):
+    if not -1.0 <= duty <= 1.0:
+        sys.exit("--duty is a fraction: 0.02 = 2 %, negative = backward")
+    left = duty if wheel in ("left", "both") else 0.0
+    right = duty if wheel in ("right", "both") else 0.0
+    print(f"Throttle {duty * 100:+.1f} % on {wheel} wheel(s) for {seconds} s. Wheels off the ground!")
+    input("Press Enter to start (Ctrl-C stops) ")
+    reader = lines(ser)
+    t0 = last_print = time.time()
+    peak = [0.0, 0.0]
+    while time.time() - t0 < seconds:
+        ser.write(f"D {left:.4f} {right:.4f}\n".encode())  # resent every 50 ms (the sketch stops after 200 ms)
+        t_send = time.time()
+        while time.time() - t_send < 0.05:
+            line = next(reader)
+            m = line and re.match(r"W (-?[\d.]+) (-?[\d.]+)", line)
+            if m:
+                w = (float(m.group(1)), float(m.group(2)))
+                peak = [max(peak[i], abs(w[i])) for i in range(2)]
+                if time.time() - last_print >= 0.1:
+                    print(f"  t {time.time() - t0:4.1f} s   left {w[0]:+6.2f} rad/s   right {w[1]:+6.2f} rad/s")
+                    last_print = time.time()
+    ser.write(b"S\n")
+    print(f"stopped. Peak speed: left {peak[0]:.2f}  right {peak[1]:.2f} rad/s"
+          + ("   (0 = didn't turn, or no speed pulses: try a bit more --duty)" if max(peak) == 0 else ""))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("test", choices=("counts", "speed"))
+    ap.add_argument("test", choices=("counts", "speed", "run"))
     ap.add_argument("port", help="e.g. /dev/ttyUSB0 or /dev/ttyACM0")
     ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--duty", type=float, default=0.02, help="run: throttle fraction, 0.02 = 2 %%, negative = backward")
+    ap.add_argument("--seconds", type=float, default=1.0, help="run: how long (default 1 s)")
+    ap.add_argument("--wheel", choices=("left", "right", "both"), default="both", help="run: which wheel")
     args = ap.parse_args()
     ser = open_port(args.port, args.baud)
     try:
-        counts_test(ser) if args.test == "counts" else speed_test(ser)
+        if args.test == "counts":
+            counts_test(ser)
+        elif args.test == "speed":
+            speed_test(ser)
+        else:
+            run_test(ser, args.duty, args.seconds, args.wheel)
     except KeyboardInterrupt:
         print()
     finally:
