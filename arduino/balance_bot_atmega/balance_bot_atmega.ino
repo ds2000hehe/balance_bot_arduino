@@ -57,9 +57,23 @@
 // Configuration
 // ------------------------------------------------------------------------------------------------------------
 
-// Pins. The speed outputs must stay on D9 / D10 (Timer1); DIR can be any free digital pin.
+// Which motor is the robot's left one. The two wiring channels are fixed:
+//   channel 1: throttle D9,  speed pulse D2, DIR D6        channel 2: throttle D10, speed pulse D3, DIR D7
+// SWAP_LEFT_RIGHT 0: channel 1 = right wheel, channel 2 = left wheel (the wiring table above)
+// SWAP_LEFT_RIGHT 1: channel 1 = left wheel,  channel 2 = right wheel
+// Check (robot on a stand, wheel_test, turn left / "j" in teleop_twist_keyboard): seen from behind, the RIGHT wheel
+// must turn forward and the LEFT one backward. The other way round: flip this. Forward driving looks the same
+// either way, but a balancing policy with swapped wheels spins on the spot at full speed.
+#define SWAP_LEFT_RIGHT 1
+
+// Pins. DIR can be any free digital pin; the throttles must stay on D9 / D10 (see below).
+#if SWAP_LEFT_RIGHT
+const uint8_t RIGHT_DIR_PIN = 7;
+const uint8_t LEFT_DIR_PIN = 6;
+#else
 const uint8_t RIGHT_DIR_PIN = 6;
 const uint8_t LEFT_DIR_PIN = 7;
+#endif
 // Throttle: right = D9, left = D10 on both supported boards (fixed, see setupPwm()). The chip is detected when
 // compiling (pick the board in the IDE / --fqbn):
 //   ATmega328P (Uno / Nano):       D9 / D10 = Timer1 OC1A / OC1B, 10-bit PWM
@@ -71,16 +85,22 @@ const uint8_t LEFT_DIR_PIN = 7;
 #else
 #error "unsupported board: pick Arduino Uno / Nano (ATmega328P) or Arduino Mega 2560"
 #endif
+#if SWAP_LEFT_RIGHT
+const uint8_t RIGHT_PWM_PIN = 10;
+const uint8_t LEFT_PWM_PIN = 9;
+#else
 const uint8_t RIGHT_PWM_PIN = 9;
 const uint8_t LEFT_PWM_PIN = 10;
+#endif
 
 // Flip these so that a positive target drives the robot forward and is measured as positive (see setup above).
 // The motors are mirrored on a two-wheeled robot, so usually exactly one of the two MOTOR_INVERTs is true.
 // FEEDBACK_INVERT only applies to FEEDBACK_HALLS (speed pulses take their sign from the commanded direction).
-const bool LEFT_MOTOR_INVERT = false;
-const bool LEFT_FEEDBACK_INVERT = false;
-const bool RIGHT_MOTOR_INVERT = true;
-const bool RIGHT_FEEDBACK_INVERT = true;
+// These belong to the wheel (left / right after SWAP_LEFT_RIGHT): the motor on channel 1 (D9) needs inverting.
+const bool LEFT_MOTOR_INVERT = SWAP_LEFT_RIGHT ? true : false;
+const bool LEFT_FEEDBACK_INVERT = SWAP_LEFT_RIGHT ? true : false;
+const bool RIGHT_MOTOR_INVERT = SWAP_LEFT_RIGHT ? false : true;
+const bool RIGHT_FEEDBACK_INVERT = SWAP_LEFT_RIGHT ? false : true;
 
 // Speed feedback:
 //   FEEDBACK_SPEED_PULSE : the drivers' speed pulse outputs (SC) on D2 (right) / D3 (left), sign = commanded direction
@@ -181,12 +201,24 @@ struct Wheel {
   uint32_t dirChangeMs; // when DIR last changed
 };
 
+// timer compare channel of each throttle pin: D9 = OC2B (Mega) / OC1A (Uno), D10 = OC2A / OC1B
 #if BOARD_MEGA
-Wheel leftWheel = {"left", LEFT_DIR_PIN, &OCR2A, COM2A1, LEFT_PWM_PIN, LEFT_MOTOR_INVERT, LEFT_FEEDBACK_INVERT};
-Wheel rightWheel = {"right", RIGHT_DIR_PIN, &OCR2B, COM2B1, RIGHT_PWM_PIN, RIGHT_MOTOR_INVERT, RIGHT_FEEDBACK_INVERT};
+#define D9_OCR OCR2B
+#define D9_COM COM2B1
+#define D10_OCR OCR2A
+#define D10_COM COM2A1
 #else
-Wheel leftWheel = {"left", LEFT_DIR_PIN, &OCR1B, COM1B1, LEFT_PWM_PIN, LEFT_MOTOR_INVERT, LEFT_FEEDBACK_INVERT};
-Wheel rightWheel = {"right", RIGHT_DIR_PIN, &OCR1A, COM1A1, RIGHT_PWM_PIN, RIGHT_MOTOR_INVERT, RIGHT_FEEDBACK_INVERT};
+#define D9_OCR OCR1A
+#define D9_COM COM1A1
+#define D10_OCR OCR1B
+#define D10_COM COM1B1
+#endif
+#if SWAP_LEFT_RIGHT
+Wheel leftWheel = {"left", LEFT_DIR_PIN, &D9_OCR, D9_COM, LEFT_PWM_PIN, LEFT_MOTOR_INVERT, LEFT_FEEDBACK_INVERT};
+Wheel rightWheel = {"right", RIGHT_DIR_PIN, &D10_OCR, D10_COM, RIGHT_PWM_PIN, RIGHT_MOTOR_INVERT, RIGHT_FEEDBACK_INVERT};
+#else
+Wheel leftWheel = {"left", LEFT_DIR_PIN, &D10_OCR, D10_COM, LEFT_PWM_PIN, LEFT_MOTOR_INVERT, LEFT_FEEDBACK_INVERT};
+Wheel rightWheel = {"right", RIGHT_DIR_PIN, &D9_OCR, D9_COM, RIGHT_PWM_PIN, RIGHT_MOTOR_INVERT, RIGHT_FEEDBACK_INVERT};
 #endif
 Wheel* const wheels[2] = {&leftWheel, &rightWheel};
 
@@ -223,6 +255,9 @@ inline void hallEdge(Wheel& w, uint8_t state, uint32_t nowUs) {
   w.lastEdgeUs = nowUs;
 }
 
+#if FEEDBACK == FEEDBACK_HALLS && SWAP_LEFT_RIGHT
+#error "SWAP_LEFT_RIGHT does not swap the hall inputs: swap the hall wires (A0-A2 <-> A3-A5) instead"
+#endif
 #if FEEDBACK == FEEDBACK_HALLS && defined(__AVR_ATmega2560__)
 #error "FEEDBACK_HALLS reads A0-A5 through port C: ATmega328P only. Use FEEDBACK_SPEED_PULSE on the Mega."
 #endif
@@ -533,8 +568,9 @@ void setupFeedback() {
   pinMode(2, inputMode);
   pinMode(3, inputMode);
   rightWheel.pulseSign = leftWheel.pulseSign = 1;
-  attachInterrupt(digitalPinToInterrupt(2), onRightPulse, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(3), onLeftPulse, CHANGE);
+  // D2 = channel 1's speed pulse, D3 = channel 2's
+  attachInterrupt(digitalPinToInterrupt(2), SWAP_LEFT_RIGHT ? onLeftPulse : onRightPulse, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(3), SWAP_LEFT_RIGHT ? onRightPulse : onLeftPulse, CHANGE);
 #endif
   uint32_t now = micros();
   for (Wheel* w : wheels) {
