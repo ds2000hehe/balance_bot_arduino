@@ -18,7 +18,8 @@
 // commands must keep coming (the ROS bridge sends 50 per second): after CMD_TIMEOUT_MS without one, the outputs
 // switch off.
 //
-// Wiring (Uno / Nano pin names)
+// Wiring (Uno / Nano pin names; on an Arduino Mega 2560 the throttles go to D11 (right) / D12 (left) instead of
+// D9 / D10, everything else is the same)
 //
 //   ZS-X11H signal header: PWM throttle, speed pulse out (SC), GND, GND, 5V out
 //
@@ -49,6 +50,10 @@
 //   3. Send "V 5 5" repeatedly, then "V -5 -5", then "V 20 20". The wheels should reach the speed within ~0.1 s,
 //      without buzzing. If you change KP / KI, change HoverboardDriveCfg in the Isaac Lab package and retrain.
 
+#include <Arduino.h>
+#include <stdint.h>
+#include <stdlib.h>
+
 // ------------------------------------------------------------------------------------------------------------
 // Configuration
 // ------------------------------------------------------------------------------------------------------------
@@ -56,7 +61,18 @@
 // Pins. The speed outputs must stay on D9 / D10 (Timer1); DIR can be any free digital pin.
 const uint8_t RIGHT_DIR_PIN = 6;
 const uint8_t LEFT_DIR_PIN = 7;
-// right speed = D9 (OC1A), left speed = D10 (OC1B): fixed, see setupPwm()
+// right speed = OC1A, left speed = OC1B: fixed, see setupPwm(). The board is detected when compiling:
+//   ATmega328P (Uno / Nano / bare 328P boards): OC1A = D9,  OC1B = D10
+//   ATmega2560 (Arduino Mega 2560):             OC1A = D11, OC1B = D12
+#if defined(__AVR_ATmega2560__) || defined(__AVR_ATmega1280__)
+const uint8_t RIGHT_PWM_PIN = 11;
+const uint8_t LEFT_PWM_PIN = 12;
+#elif defined(__AVR_ATmega328P__) || defined(__AVR_ATmega328__) || defined(__AVR_ATmega168__)
+const uint8_t RIGHT_PWM_PIN = 9;
+const uint8_t LEFT_PWM_PIN = 10;
+#else
+#error "unsupported board: pick Arduino Uno / Nano (ATmega328P) or Arduino Mega 2560"
+#endif
 
 // Flip these so that a positive target drives the robot forward and is measured as positive (see setup above).
 // The motors are mirrored on a two-wheeled robot, so usually exactly one of the two MOTOR_INVERTs is true.
@@ -114,9 +130,6 @@ const uint32_t CMD_TIMEOUT_MS = 200;      // no "V" / "D" command for this long 
 
 // ------------------------------------------------------------------------------------------------------------
 
-#include <Arduino.h>
-#include <stdlib.h>
-
 const uint16_t PWM_TOP = 1023;  // Timer1 fast PWM, TOP = ICR1: 10 bits
 
 struct Wheel {
@@ -143,8 +156,8 @@ struct Wheel {
   float integral;  // rad
 };
 
-Wheel leftWheel = {"left", LEFT_DIR_PIN, &OCR1B, COM1B1, 10, LEFT_MOTOR_INVERT, LEFT_FEEDBACK_INVERT};
-Wheel rightWheel = {"right", RIGHT_DIR_PIN, &OCR1A, COM1A1, 9, RIGHT_MOTOR_INVERT, RIGHT_FEEDBACK_INVERT};
+Wheel leftWheel = {"left", LEFT_DIR_PIN, &OCR1B, COM1B1, LEFT_PWM_PIN, LEFT_MOTOR_INVERT, LEFT_FEEDBACK_INVERT};
+Wheel rightWheel = {"right", RIGHT_DIR_PIN, &OCR1A, COM1A1, RIGHT_PWM_PIN, RIGHT_MOTOR_INVERT, RIGHT_FEEDBACK_INVERT};
 Wheel* const wheels[2] = {&leftWheel, &rightWheel};
 
 enum Mode { MODE_OFF, MODE_SPEED, MODE_OPEN_LOOP };
@@ -179,6 +192,10 @@ inline void hallEdge(Wheel& w, uint8_t state, uint32_t nowUs) {
   w.count += (step == 1) ? 1 : -1;
   w.lastEdgeUs = nowUs;
 }
+
+#if FEEDBACK == FEEDBACK_HALLS && defined(__AVR_ATmega2560__)
+#error "FEEDBACK_HALLS reads A0-A5 through port C: ATmega328P only. Use FEEDBACK_SPEED_PULSE on the Mega."
+#endif
 
 #if FEEDBACK == FEEDBACK_HALLS
 ISR(PCINT1_vect) {
@@ -239,16 +256,16 @@ void updateVelocity(Wheel& w, uint32_t nowUs) {
 // ---- motor output ----
 
 void setupPwm() {
-  // Timer1 fast PWM, mode 14 (TOP = ICR1) on OC1A (D9) and OC1B (D10): 16 MHz / 1024 = 15.6 kHz without
+  // Timer1 fast PWM, mode 14 (TOP = ICR1) on OC1A and OC1B: 16 MHz / 1024 = 15.6 kHz without
   // prescaler, / 8 = 1.95 kHz
   TCCR1A = (1 << WGM11);
   TCCR1B = (1 << WGM13) | (1 << WGM12) | (PWM_SLOW ? (1 << CS11) : (1 << CS10));
   ICR1 = PWM_TOP;
   OCR1A = OCR1B = 0;
-  pinMode(9, OUTPUT);
-  pinMode(10, OUTPUT);
-  digitalWrite(9, LOW);
-  digitalWrite(10, LOW);
+  pinMode(RIGHT_PWM_PIN, OUTPUT);
+  pinMode(LEFT_PWM_PIN, OUTPUT);
+  digitalWrite(RIGHT_PWM_PIN, LOW);
+  digitalWrite(LEFT_PWM_PIN, LOW);
 }
 
 // 0 .. PWM_TOP. Zero disconnects the timer from the pin and holds it low (fast PWM with OCR = 0 still gives a short

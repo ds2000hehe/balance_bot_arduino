@@ -18,6 +18,8 @@ Each ZS-X11H has a 5-pin signal header (PWM throttle, speed pulse out, GND, GND,
 | 5V out | not connected | not connected |
 | DIR | D6 | D7 |
 
+* Arduino Mega 2560: throttles on **D11 (right) / D12 (left)** instead of D9 / D10 (Timer1 is on other pins there);
+  everything else is the same. Compile with `--fqbn arduino:avr:mega`.
 * D9 / D10 are fixed: the only pins of the 16-bit timer (fast 10-bit PWM, 15.6 kHz). They connect straight to the
   throttle inputs. If a motor does not respond smoothly to `D 0.1 0.1` .. `D 0.5 0.5`, set `PWM_SLOW 1` (1.95 kHz).
 * D2 / D3 are fixed: the two interrupt pins. The speed pulses carry no direction, so the firmware takes the sign from
