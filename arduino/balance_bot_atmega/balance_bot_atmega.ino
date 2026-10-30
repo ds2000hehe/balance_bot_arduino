@@ -1,0 +1,470 @@
+// Balance bot wheel controller for an ATmega328P board (Arduino Uno / Nano, 16 MHz, Arduino IDE board "Arduino Uno"
+// or "Arduino Nano") driving two hoverboard hub motors through ZS-X11H BLDC drivers (36 V) with PWM throttle +
+// DIR only. The drivers' BRAKE and STOP inputs are not used: tie them (or leave them) at the level that lets the
+// motor run.
+//
+// Same serial protocol as the ESP32 version (arduino/esp32_legacy/balance_bot_esp32), so the ROS bridge, wheel_check and the
+// policy work unchanged:
+//
+//   PC -> Arduino   "V <left> <right>\n"   wheel speed targets [rad/s], positive = drive the robot forward
+//                   "S\n"                  stop: throttle 0 (wheels coast) until the next V / D
+//                   "D <left> <right>\n"   open-loop test: raw duty in [-1, 1], no speed loop (wheels lifted!)
+//                   "G <kp> <ki>\n"        set the velocity loop gains (kp in duty per rad/s, ki in duty per rad)
+//                   "?\n"                  print the configuration, hall counts and hall errors
+//   Arduino -> PC   "W <left> <right>\n"   measured wheel speeds [rad/s] at REPORT_HZ, positive = forward
+//                   "# ...\n"              information lines (ignored by the ROS bridge, shown in its log)
+//
+// "left" and "right" are seen from behind the robot (front = where it drives with positive speed). "V" and "D"
+// commands must keep coming (the ROS bridge sends 50 per second): after CMD_TIMEOUT_MS without one, the outputs
+// switch off.
+//
+// Wiring (Uno / Nano pin names)
+//
+//   ZS-X11H signal header: PWM throttle, speed pulse out (SC), GND, GND, 5V out
+//
+//   Right driver   PWM throttle <- D9     SC -> D2     GND - Arduino GND     DIR <- D6     5V out: not connected
+//   Left driver    PWM throttle <- D10    SC -> D3     GND - Arduino GND     DIR <- D7     5V out: not connected
+//
+//   * Throttle: D9 / D10 are the two outputs of Timer1, the only timer that gives a fast, 10-bit PWM. Connect them
+//     straight to the drivers' PWM throttle inputs (duty 0-100 % = stop to full speed). PWM_SLOW selects 15.6 kHz or
+//     2 kHz, see below.
+//   * Leave the drivers' 5V outputs unconnected: the Arduino is powered over USB, and two 5 V supplies must not be
+//     tied together. One GND per driver to the Arduino's GND is needed (the signals are measured against it).
+//   * If the driver has an onboard speed potentiometer, turn it to minimum.
+//   * Speed feedback, FEEDBACK_SPEED_PULSE (default): each driver's speed pulse output ("SC"), one wire per motor:
+//         right SC -> D2, left SC -> D3       (the two external interrupt pins; 5 V signals connect directly)
+//     It has no direction, so the sign comes from the commanded direction (worse for balancing near zero speed).
+//     COUNTS_PER_REV must be the number of SC edges per wheel turn: measure it (first-time setup, step 1).
+//     FEEDBACK_HALLS (better, if you can tap them): each motor's three hall wires in parallel with the driver:
+//         left  hall A -> A0, B -> A1, C -> A2        right hall A -> A3, B -> A4, C -> A5
+//
+// First-time setup, wheels off the ground, Arduino Serial Monitor at 115200 baud, line ending "Newline":
+//   1. Send "?", turn each wheel exactly one turn forward by hand, send "?" again. FEEDBACK_SPEED_PULSE: the count
+//      change is the number of SC edges per turn: put it into COUNTS_PER_REV (the sign does not matter here, it
+//      follows the commanded direction). FEEDBACK_HALLS: the count must change by about +90; negative: flip that
+//      wheel's FEEDBACK_INVERT; hall errors that keep growing: a hall wire is swapped, missing, or noisy.
+//   2. Send "D 0.1 0.1" a few times a second (or paste it repeatedly): both wheels must turn forward and "W" must be
+//      positive. A wheel turning backward: flip its MOTOR_INVERT. Send "D 0.5 0.5": "W" x 2 is roughly
+//      MOTOR_MAX_RAD_S. (The ROS tool `ros2 run balance_bot_policy wheel_check` measures all of this for you.)
+//   3. Send "V 5 5" repeatedly, then "V -5 -5", then "V 20 20". The wheels should reach the speed within ~0.1 s,
+//      without buzzing. If you change KP / KI, change HoverboardDriveCfg in the Isaac Lab package and retrain.
+
+// ------------------------------------------------------------------------------------------------------------
+// Configuration
+// ------------------------------------------------------------------------------------------------------------
+
+// Pins. The speed outputs must stay on D9 / D10 (Timer1); DIR can be any free digital pin.
+const uint8_t RIGHT_DIR_PIN = 6;
+const uint8_t LEFT_DIR_PIN = 7;
+// right speed = D9 (OC1A), left speed = D10 (OC1B): fixed, see setupPwm()
+
+// Flip these so that a positive target drives the robot forward and is measured as positive (see setup above).
+// The motors are mirrored on a two-wheeled robot, so usually exactly one of the two MOTOR_INVERTs is true.
+// FEEDBACK_INVERT only applies to FEEDBACK_HALLS (speed pulses take their sign from the commanded direction).
+const bool LEFT_MOTOR_INVERT = false;
+const bool LEFT_FEEDBACK_INVERT = false;
+const bool RIGHT_MOTOR_INVERT = true;
+const bool RIGHT_FEEDBACK_INVERT = true;
+
+// Speed feedback:
+//   FEEDBACK_SPEED_PULSE : the drivers' speed pulse outputs (SC) on D2 (right) / D3 (left), sign = commanded direction
+//                          (the default: only one wire per motor)
+//   FEEDBACK_HALLS       : the motors' three hall sensors tapped onto A0-A5, decoded here (direction-aware, better)
+#define FEEDBACK_HALLS 1
+#define FEEDBACK_SPEED_PULSE 2
+#define FEEDBACK FEEDBACK_SPEED_PULSE
+
+const bool HALL_PULLUPS = false;  // true: enable the ATmega's pull-ups (only if nothing else pulls the lines up)
+
+// Motor pole pairs (hoverboard hub motors: 15, i.e. 30 magnets). Three halls give 6 states per electrical revolution,
+// so 90 counts per wheel turn.
+const int POLE_PAIRS = 15;
+// FEEDBACK_SPEED_PULSE: SC edges per wheel turn, MEASURE IT (step 1); 90 is only a guess (one edge per hall change)
+const float COUNTS_PER_REV = 6.0f * POLE_PAIRS;
+
+// Wheel speed at full duty (100 % throttle PWM) with your battery [rad/s]. Used as the feed-forward (step 2).
+// Hoverboard hub motors turn about 16 RPM per volt with no load: roughly 1.7 x battery volts in rad/s
+// (36 V -> 60 rad/s).
+const float MOTOR_MAX_RAD_S = 60.0f;
+
+// The policy was trained for wheel speeds up to 30 rad/s (WHEEL_MAX_SPEED in the Isaac Lab package).
+const float MAX_TARGET_RAD_S = 30.0f;
+
+// Velocity loop: duty = target / MOTOR_MAX_RAD_S + KP * error + KI * integral(error), duty in [-1, 1].
+// The feed-forward does most of the work: the driver drives current both ways, so the motor's back-EMF already pulls
+// the wheel to about target speed. Keep KP / KI low: below ~2 rad/s the hall speed estimate is coarse and delayed
+// (one edge per 35+ ms), and a stiff loop reacting to it makes the wheels twitch. Must match HoverboardDriveCfg.
+float KP = 0.01f;  // duty per rad/s of error
+float KI = 0.2f;   // duty per rad of accumulated error
+
+// Kick added in the target's direction to get past the driver's dead zone at low duty. 0 = let the integral do it
+// (what the policy is trained with); wheel_check measures the dead zone.
+const float MIN_DUTY = 0.0f;
+
+// Throttle PWM frequency: 0 = 15.6 kHz (default), 1 = 1.95 kHz. Both 10-bit. ZS-X11H boards are usually specified
+// for ~1-20 kHz; if the motor does not respond smoothly to "D 0.1 0.1" .. "D 0.5 0.5", try the other one.
+#define PWM_SLOW 0
+
+const uint32_t SERIAL_BAUD = 115200;
+const float CONTROL_HZ = 500.0f;          // velocity loop rate
+const float REPORT_HZ = 100.0f;           // "W" message rate (the policy runs at 50 Hz)
+const uint32_t STANDSTILL_US = 100000;    // no hall edge for this long -> speed 0
+const float MAX_MEASURED_RAD_S = 100.0f;  // clip speed estimates (two edges microseconds apart give absurd values)
+const uint32_t CMD_TIMEOUT_MS = 200;      // no "V" / "D" command for this long -> outputs off
+
+// ------------------------------------------------------------------------------------------------------------
+
+#include <Arduino.h>
+#include <stdlib.h>
+
+const uint16_t PWM_TOP = 1023;  // Timer1 fast PWM, TOP = ICR1: 10 bits
+
+struct Wheel {
+  const char* name;
+  uint8_t dirPin;
+  volatile uint16_t* ocr;  // Timer1 compare register of this wheel's speed output
+  uint8_t comBit;          // TCCR1A bit that connects the output (COM1A1 / COM1B1)
+  uint8_t pwmPin;
+  bool motorInvert, feedbackInvert;
+
+  // written by the feedback interrupt (read with interrupts off)
+  volatile int32_t count;
+  volatile uint32_t lastEdgeUs;
+  volatile uint8_t hallState;
+  volatile uint32_t hallErrors;
+  volatile int8_t pulseSign;  // FEEDBACK_SPEED_PULSE: +1 / -1 = direction the driver is pushing (forward = +1)
+
+  int32_t prevCount;
+  uint32_t prevEdgeUs;
+  int8_t lastDir;  // direction of the last counted edge(s): +1, -1, 0 = none yet
+  float target;    // rad/s, forward positive
+  float duty;      // open-loop duty ("D" command)
+  float velocity;  // rad/s, forward positive
+  float integral;  // rad
+};
+
+Wheel leftWheel = {"left", LEFT_DIR_PIN, &OCR1B, COM1B1, 10, LEFT_MOTOR_INVERT, LEFT_FEEDBACK_INVERT};
+Wheel rightWheel = {"right", RIGHT_DIR_PIN, &OCR1A, COM1A1, 9, RIGHT_MOTOR_INVERT, RIGHT_FEEDBACK_INVERT};
+Wheel* const wheels[2] = {&leftWheel, &rightWheel};
+
+enum Mode { MODE_OFF, MODE_SPEED, MODE_OPEN_LOOP };
+Mode mode = MODE_OFF;
+uint32_t lastCmdMs = 0;
+
+// ---- speed feedback ----
+
+// hall state (A << 2 | B << 1 | C) -> position in the 6-step sequence 1, 3, 2, 6, 4, 5; -1 = invalid (000, 111)
+const int8_t HALL_INDEX[8] = {-1, 0, 2, 1, 4, 5, 3, -1};
+
+// port C bits PC0..PC2 = A0..A2 (left A, B, C), PC3..PC5 = A3..A5 (right A, B, C)
+inline uint8_t hallStateFromPort(uint8_t port, uint8_t shift) {
+  uint8_t bits = (port >> shift) & 0x07;  // bit 0 = A, bit 1 = B, bit 2 = C
+  return ((bits & 0x01) << 2) | (bits & 0x02) | ((bits & 0x04) >> 2);
+}
+
+inline void hallEdge(Wheel& w, uint8_t state, uint32_t nowUs) {
+  if (state == w.hallState) return;  // the other motor's lines changed
+  int8_t index = HALL_INDEX[state];
+  int8_t prevIndex = HALL_INDEX[w.hallState];
+  w.hallState = state;
+  if (index < 0 || prevIndex < 0) {
+    w.hallErrors++;
+    return;
+  }
+  int8_t step = (index - prevIndex + 6) % 6;  // 1 = one step one way, 5 = one step the other way
+  if (step != 1 && step != 5) {
+    w.hallErrors++;  // skipped a state: noise or a swapped wire
+    return;
+  }
+  w.count += (step == 1) ? 1 : -1;
+  w.lastEdgeUs = nowUs;
+}
+
+#if FEEDBACK == FEEDBACK_HALLS
+ISR(PCINT1_vect) {
+  uint8_t port = PINC;
+  uint32_t now = micros();
+  hallEdge(leftWheel, hallStateFromPort(port, 0), now);
+  hallEdge(rightWheel, hallStateFromPort(port, 3), now);
+}
+#else
+void onRightPulse() {
+  rightWheel.count += rightWheel.pulseSign;
+  rightWheel.lastEdgeUs = micros();
+}
+void onLeftPulse() {
+  leftWheel.count += leftWheel.pulseSign;
+  leftWheel.lastEdgeUs = micros();
+}
+#endif
+
+// Speed from the time between hall edges: with only ~90 counts per turn, counting edges per control period would
+// give a resolution of several rad/s. Between edges the speed can be at most one count over the time since the last
+// edge, which lets a stopping wheel's speed fall smoothly to zero.
+void updateVelocity(Wheel& w, uint32_t nowUs) {
+  noInterrupts();
+  int32_t count = w.count;
+  uint32_t edgeUs = w.lastEdgeUs;
+  interrupts();
+  if (FEEDBACK == FEEDBACK_HALLS && w.feedbackInvert) count = -count;  // speed pulses are already signed forward
+  const float radPerCount = 2.0f * PI / COUNTS_PER_REV;
+
+  int32_t newCounts = count - w.prevCount;
+  if (newCounts != 0) {
+    uint32_t dt = edgeUs - w.prevEdgeUs;  // spans exactly newCounts counts
+    if (dt > STANDSTILL_US) dt = STANDSTILL_US;  // first edge after standing still
+    if (dt == 0) dt = 1;
+    int8_t dir = newCounts > 0 ? 1 : -1;
+    if (w.lastDir != 0 && dir != w.lastDir) {
+      // the wheel rocked back over the same hall boundary: dt is not the time for one count (it can be a few ms,
+      // which would read as 10+ rad/s and kick the speed loop). The wheel has just passed through zero speed.
+      w.velocity = 0.0f;
+    } else {
+      w.velocity = constrain(newCounts * radPerCount / (dt * 1e-6f), -MAX_MEASURED_RAD_S, MAX_MEASURED_RAD_S);
+    }
+    w.lastDir = dir;
+    w.prevCount = count;
+    w.prevEdgeUs = edgeUs;
+  } else {
+    uint32_t since = nowUs - edgeUs;
+    if (since >= STANDSTILL_US) {
+      w.velocity = 0.0f;
+    } else {
+      float bound = radPerCount / (since * 1e-6f + 1e-6f);
+      if (fabs(w.velocity) > bound) w.velocity = w.velocity > 0.0f ? bound : -bound;
+    }
+  }
+}
+
+// ---- motor output ----
+
+void setupPwm() {
+  // Timer1 fast PWM, mode 14 (TOP = ICR1) on OC1A (D9) and OC1B (D10): 16 MHz / 1024 = 15.6 kHz without
+  // prescaler, / 8 = 1.95 kHz
+  TCCR1A = (1 << WGM11);
+  TCCR1B = (1 << WGM13) | (1 << WGM12) | (PWM_SLOW ? (1 << CS11) : (1 << CS10));
+  ICR1 = PWM_TOP;
+  OCR1A = OCR1B = 0;
+  pinMode(9, OUTPUT);
+  pinMode(10, OUTPUT);
+  digitalWrite(9, LOW);
+  digitalWrite(10, LOW);
+}
+
+// 0 .. PWM_TOP. Zero disconnects the timer from the pin and holds it low (fast PWM with OCR = 0 still gives a short
+// spike every period).
+void writePwm(Wheel& w, uint16_t value) {
+  if (value == 0) {
+    TCCR1A &= ~(1 << w.comBit);
+    digitalWrite(w.pwmPin, LOW);
+  } else {
+    *w.ocr = value > PWM_TOP ? PWM_TOP : value;
+    TCCR1A |= (1 << w.comBit);
+  }
+}
+
+// duty in [-1, 1], positive = forward; the driver handles direction changes at speed by itself
+void driveMotor(Wheel& w, float duty) {
+  bool forward = duty >= 0.0f;
+  digitalWrite(w.dirPin, (forward != w.motorInvert) ? HIGH : LOW);
+  w.pulseSign = forward ? 1 : -1;
+  writePwm(w, (uint16_t)(fabs(duty) * PWM_TOP + 0.5f));
+}
+
+// ---- velocity loop ----
+
+void controlWheel(Wheel& w, float dt) {
+  if (mode == MODE_OFF) {
+    w.integral = 0.0f;
+    writePwm(w, 0);
+    return;
+  }
+  if (mode == MODE_OPEN_LOOP) {
+    w.integral = 0.0f;
+    driveMotor(w, w.duty);
+    return;
+  }
+  float error = w.target - w.velocity;
+  float duty = w.target / MOTOR_MAX_RAD_S + KP * error + KI * w.integral;
+  if (MIN_DUTY > 0.0f && fabs(w.target) > 0.2f) duty += (w.target > 0.0f ? MIN_DUTY : -MIN_DUTY);
+  duty = constrain(duty, -1.0f, 1.0f);
+  // anti-windup: hold the integral while saturated in the direction of the error
+  bool saturated = (duty >= 1.0f && error > 0.0f) || (duty <= -1.0f && error < 0.0f);
+  if (!saturated) w.integral += error * dt;
+  driveMotor(w, duty);
+}
+
+// ---- serial protocol ----
+
+void printConfig() {
+  Serial.println(F("# balance bot ATmega BLDC wheel controller (ZS-X11H, speed D9/D10 + DIR D6/D7)"));
+  Serial.print(F("# feedback "));
+  Serial.print(FEEDBACK == FEEDBACK_HALLS ? F("halls A0-A5") : F("speed pulse D2/D3"));
+  Serial.print(F(", "));
+  Serial.print(COUNTS_PER_REV, 0);
+  Serial.print(F(" counts/rev, max "));
+  Serial.print(MOTOR_MAX_RAD_S, 1);
+  Serial.print(F(" rad/s, target limit "));
+  Serial.print(MAX_TARGET_RAD_S, 1);
+  Serial.println(F(" rad/s"));
+  Serial.print(F("# kp "));
+  Serial.print(KP, 4);
+  Serial.print(F(" ki "));
+  Serial.print(KI, 4);
+  Serial.print(F(", control "));
+  Serial.print(CONTROL_HZ, 0);
+  Serial.print(F(" Hz, report "));
+  Serial.print(REPORT_HZ, 0);
+  Serial.print(F(" Hz, timeout "));
+  Serial.print(CMD_TIMEOUT_MS);
+  Serial.println(F(" ms"));
+  for (Wheel* w : wheels) {
+    noInterrupts();
+    int32_t count = w->count;
+    uint8_t state = w->hallState;
+    uint32_t errors = w->hallErrors;
+    interrupts();
+    Serial.print(F("# "));
+    Serial.print(w->name);
+    Serial.print(F(": count "));
+    Serial.print(FEEDBACK == FEEDBACK_HALLS && w->feedbackInvert ? -count : count);
+    Serial.print(F(", hall state "));
+    Serial.print(state);
+    Serial.print(F(", hall errors "));
+    Serial.println(errors);
+  }
+}
+
+bool parseTwo(char* text, float& a, float& b) {
+  char* end;
+  a = strtod(text, &end);
+  if (end == text) return false;
+  char* end2;
+  b = strtod(end, &end2);
+  return end2 != end;
+}
+
+void handleLine(char* line) {
+  float a, b;
+  switch (line[0]) {
+    case 'V':
+      if (!parseTwo(line + 1, a, b)) break;
+      leftWheel.target = constrain(a, -MAX_TARGET_RAD_S, MAX_TARGET_RAD_S);
+      rightWheel.target = constrain(b, -MAX_TARGET_RAD_S, MAX_TARGET_RAD_S);
+      mode = MODE_SPEED;
+      lastCmdMs = millis();
+      break;
+    case 'D':
+      if (!parseTwo(line + 1, a, b)) break;
+      leftWheel.duty = constrain(a, -1.0f, 1.0f);
+      rightWheel.duty = constrain(b, -1.0f, 1.0f);
+      mode = MODE_OPEN_LOOP;
+      lastCmdMs = millis();
+      break;
+    case 'S':
+      mode = MODE_OFF;
+      leftWheel.target = rightWheel.target = 0.0f;
+      break;
+    case 'G':
+      if (parseTwo(line + 1, a, b)) {
+        KP = a;
+        KI = b;
+      }
+      Serial.print(F("# kp "));
+      Serial.print(KP, 4);
+      Serial.print(F(" ki "));
+      Serial.println(KI, 4);
+      break;
+    case '?':
+      printConfig();
+      break;
+    default:
+      break;
+  }
+}
+
+void readSerial() {
+  static char buf[48];
+  static uint8_t len = 0;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      buf[len] = '\0';
+      if (len > 0) handleLine(buf);
+      len = 0;
+    } else if (len < sizeof(buf) - 1) {
+      buf[len++] = c;
+    } else {
+      len = 0;  // overlong line: drop it
+    }
+  }
+}
+
+// ---- main ----
+
+void setupFeedback() {
+  const uint8_t inputMode = HALL_PULLUPS ? INPUT_PULLUP : INPUT;
+#if FEEDBACK == FEEDBACK_HALLS
+  for (uint8_t pin = A0; pin <= A5; pin++) pinMode(pin, inputMode);
+  uint8_t port = PINC;
+  leftWheel.hallState = hallStateFromPort(port, 0);
+  rightWheel.hallState = hallStateFromPort(port, 3);
+  PCMSK1 = 0x3F;           // PCINT8..13 = A0..A5
+  PCIFR = (1 << PCIF1);    // clear a pending flag
+  PCICR |= (1 << PCIE1);   // enable the port C pin-change interrupt
+#else
+  pinMode(2, inputMode);
+  pinMode(3, inputMode);
+  rightWheel.pulseSign = leftWheel.pulseSign = 1;
+  attachInterrupt(digitalPinToInterrupt(2), onRightPulse, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(3), onLeftPulse, CHANGE);
+#endif
+  uint32_t now = micros();
+  for (Wheel* w : wheels) {
+    w->lastEdgeUs = w->prevEdgeUs = now;
+    w->lastDir = 0;
+  }
+}
+
+void setup() {
+  pinMode(LEFT_DIR_PIN, OUTPUT);
+  pinMode(RIGHT_DIR_PIN, OUTPUT);
+  setupPwm();
+  Serial.begin(SERIAL_BAUD);
+  setupFeedback();
+  printConfig();
+}
+
+void loop() {
+  static uint32_t lastControlUs = micros();
+  static uint32_t lastReportUs = micros();
+  const uint32_t controlPeriodUs = (uint32_t)(1e6f / CONTROL_HZ);
+  const uint32_t reportPeriodUs = (uint32_t)(1e6f / REPORT_HZ);
+
+  readSerial();
+  if (mode != MODE_OFF && millis() - lastCmdMs > CMD_TIMEOUT_MS) {
+    mode = MODE_OFF;  // PC or cable gone: switch the motors off
+    leftWheel.target = rightWheel.target = 0.0f;
+    Serial.print(F("# no command for "));
+    Serial.print(CMD_TIMEOUT_MS);
+    Serial.println(F(" ms, motors off"));
+  }
+
+  uint32_t now = micros();
+  if (now - lastControlUs >= controlPeriodUs) {
+    lastControlUs += controlPeriodUs;
+    if (now - lastControlUs > 10 * controlPeriodUs) lastControlUs = now;  // fell far behind: resync
+    for (Wheel* w : wheels) {
+      updateVelocity(*w, now);
+      controlWheel(*w, 1.0f / CONTROL_HZ);
+    }
+  }
+  if (now - lastReportUs >= reportPeriodUs) {
+    lastReportUs += reportPeriodUs;
+    if (now - lastReportUs > 10 * reportPeriodUs) lastReportUs = now;
+    Serial.print(F("W "));
+    Serial.print(leftWheel.velocity, 3);
+    Serial.print(' ');
+    Serial.println(rightWheel.velocity, 3);
+  }
+}
