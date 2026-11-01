@@ -153,7 +153,7 @@ const uint32_t DIR_MIN_HOLD_MS = 30;
 
 const uint32_t SERIAL_BAUD = 115200;
 const float CONTROL_HZ = 500.0f;          // velocity loop rate
-const float REPORT_HZ = 100.0f;           // "W" message rate (the policy runs at 50 Hz)
+const float REPORT_HZ = 200.0f;           // "W" message rate: fresher wheel speeds for the 50 Hz policy (~4 kB/s)
 const uint32_t STANDSTILL_US = 100000;    // no hall edge for this long -> speed 0
 const float MAX_MEASURED_RAD_S = 100.0f;  // clip speed estimates (two edges microseconds apart give absurd values)
 const uint32_t CMD_TIMEOUT_MS = 200;      // no "V" / "D" command for this long -> outputs off
