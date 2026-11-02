@@ -227,7 +227,7 @@ def brake_test(ser: serial.Serial, duty: float):
             after = hold(ser, reader, *d, 1.2, wheel)
             ser.write(b"K -1 -1\nB 1\nS\n")
             v03, half = slowdown(after, v0)
-            result[label] = half
+            result[label] = v03
             print(f"  {label:34s}: {v0:5.1f} rad/s -> {v03:5.1f} after 0.3 s, half speed after "
                   + (f"{half * 1000:4.0f} ms" if half == half else "  > 1.2 s"))
             time.sleep(2.0)  # coast to a stop
@@ -235,8 +235,8 @@ def brake_test(ser: serial.Serial, duty: float):
             print(f"  -> the {name} wheel did not spin up (driver powered? try a higher --duty)")
             continue
         coast, own, other = (result[k] for k in list(result)[:3])
-        def faster(x):  # clearly faster than coasting
-            return x == x and (coast != coast or x < 0.5 * coast)
+        def faster(x):  # speed after 0.3 s clearly below coasting's
+            return x == x and coast == coast and x < 0.5 * coast
         if faster(own):
             print(f"  -> {name} brake works, pin and polarity right")
         elif faster(other):
