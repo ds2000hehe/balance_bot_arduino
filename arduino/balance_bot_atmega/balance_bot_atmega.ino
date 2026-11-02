@@ -147,6 +147,15 @@ const float DUTY_SLEW_PER_S = 4.0f;     // 0 -> 100 % in 0.25 s, 0 -> 30 % in 75
 const float REVERSE_MAX_RAD_S = 100.0f; // no block: reversing brakes hard at any speed (reverse_test 2026-11-02: half
                                         // speed in 13-31 ms from 20 rad/s vs 220-250 ms coasting). Was 3 (~0.25 m/s)
 const uint32_t DIR_MIN_HOLD_MS = 30;
+// Braking by reversal (raw duty "D" mode only). The ZS-X11H coasts when the throttle drops but brakes hard when
+// reversed (reverse_test). When a wheel turns more than REVERSE_BRAKE_MARGIN faster than the throttle asks for, it is
+// reversed with REVERSE_BRAKE_GAIN * excess / MOTOR_MAX_RAD_S (at most REVERSE_BRAKE_MAX) until it is down to the
+// throttle's speed. Same as the training's drive model (reverse_brake): policies trained with it (smooth21) need it.
+const bool REVERSE_BRAKE = true;
+const float REVERSE_BRAKE_MARGIN = 5.0f;  // rad/s
+const float REVERSE_BRAKE_GAIN = 0.5f;
+const float REVERSE_BRAKE_MAX = 0.08f;    // duty
+const float REVERSE_BRAKE_MIN = 1.5f;     // rad/s, no braking below (coarse speed pulses)
 
 // Throttle PWM frequency: 0 = 15.6 kHz (default), 1 = 1.95 kHz. Both 10-bit. ZS-X11H boards are usually specified
 // for ~1-20 kHz; if the motor does not respond smoothly to "D 0.1 0.1" .. "D 0.5 0.5", try the other one.
@@ -200,6 +209,8 @@ struct Wheel {
   float appliedDuty;    // what actually goes to the driver, after the output protection, [-1, 1]
   int8_t dirSign;       // direction DIR currently selects: +1 forward, -1 backward
   uint32_t dirChangeMs; // when DIR last changed
+  bool braking;         // braking by reversal (REVERSE_BRAKE)
+  int8_t brakeDir;      // direction the wheel was turning when braking started
 };
 
 // timer compare channel of each throttle pin: D9 = OC2B (Mega) / OC1A (Uno), D10 = OC2A / OC1B
@@ -420,19 +431,37 @@ bool driveMotor(Wheel& w, float duty, float dt) {
   return limited;
 }
 
+// braking by reversal (see REVERSE_BRAKE): returns the duty to apply for the policy's duty
+float reverseBrake(Wheel& w, float duty) {
+  float speed = fabs(w.velocity);  // the speed pulses' magnitude does not depend on DIR
+  int8_t motion = w.braking ? w.brakeDir : w.dirSign;
+  float along = duty * motion;     // throttle in the direction of motion (< 0: reverse asked for directly)
+  float target = (along > 0.0f ? along : 0.0f) * MOTOR_MAX_RAD_S;
+  float excess = speed - target;
+  bool start = !w.braking && along >= 0.0f && excess > REVERSE_BRAKE_MARGIN && speed > REVERSE_BRAKE_MIN;
+  bool keep = w.braking && along >= 0.0f && excess > 0.0f && speed > REVERSE_BRAKE_MIN;
+  if (start) w.brakeDir = w.dirSign;
+  w.braking = start || keep;
+  if (!w.braking) return duty;
+  float brake = constrain(REVERSE_BRAKE_GAIN * excess / MOTOR_MAX_RAD_S, 0.0f, REVERSE_BRAKE_MAX);
+  return -w.brakeDir * brake;
+}
+
 // ---- velocity loop ----
 
 void controlWheel(Wheel& w, float dt) {
   if (mode == MODE_OFF) {
     w.integral = 0.0f;
+    w.braking = false;
     stopMotor(w);
     return;
   }
   if (mode == MODE_OPEN_LOOP) {
     w.integral = 0.0f;
-    driveMotor(w, w.duty, dt);
+    driveMotor(w, REVERSE_BRAKE ? reverseBrake(w, w.duty) : w.duty, dt);
     return;
   }
+  w.braking = false;
   float error = w.target - w.velocity;
   float duty = w.target / MOTOR_MAX_RAD_S + KP * error + KI * w.integral;
   if (MIN_DUTY > 0.0f && fabs(w.target) > 0.2f) duty += (w.target > 0.0f ? MIN_DUTY : -MIN_DUTY);
