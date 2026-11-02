@@ -144,7 +144,8 @@ const float MIN_DUTY = 0.0f;
 //     DIR_MIN_HOLD_MS after the last change (no chattering when the speed loop hovers around zero)
 // The wheel coasts (throttle 0) while a reversal waits.
 const float DUTY_SLEW_PER_S = 4.0f;     // 0 -> 100 % in 0.25 s, 0 -> 30 % in 75 ms
-const float REVERSE_MAX_RAD_S = 3.0f;   // ~0.25 m/s at the tyre
+const float REVERSE_MAX_RAD_S = 100.0f; // no block: reversing brakes hard at any speed (reverse_test 2026-11-02: half
+                                        // speed in 13-31 ms from 20 rad/s vs 220-250 ms coasting). Was 3 (~0.25 m/s)
 const uint32_t DIR_MIN_HOLD_MS = 30;
 
 // Throttle PWM frequency: 0 = 15.6 kHz (default), 1 = 1.95 kHz. Both 10-bit. ZS-X11H boards are usually specified
