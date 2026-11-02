@@ -266,52 +266,94 @@ def decay_rate(samples: list[tuple[float, float]], v0: float) -> float:
     return -num / den if den > 0 else float("nan")
 
 
+def speed_at(samples: list[tuple[float, float]], t: float) -> float:
+    """Speed at time t after the throttle drop (linear interpolation of the reports)."""
+    for (t0, v0), (t1, v1) in zip(samples, samples[1:]):
+        if t0 <= t <= t1:
+            return v0 + (v1 - v0) * (t - t0) / (t1 - t0) if t1 > t0 else v0
+    return samples[-1][1] if samples and t > samples[-1][0] else float("nan")
+
+
+PROFILE_T = (0.05, 0.1, 0.15, 0.2, 0.3)
+
+
+def brake_trial(ser, reader, wheel: int, duty: float, frac: float, hz: float) -> tuple[float, list[float]]:
+    """Spin one wheel up, then throttle 0 with brake fraction frac at pulse rate hz. Returns (v0, speeds at PROFILE_T)."""
+    ser.write(f"K -1 -1\nB 0\nF {hz:.0f}\n".encode())
+    d = (duty, 0.0) if wheel == 0 else (0.0, duty)
+    spun = hold(ser, reader, *d, 1.5, wheel)
+    tail = [v for t, v in spun if t > 1.0]
+    v0 = sum(tail) / max(1, len(tail))
+    k = (frac, 0.0) if wheel == 0 else (0.0, frac)
+    ser.write(f"K {k[0]:.2f} {k[1]:.2f}\n".encode())
+    after = hold(ser, reader, 0.0, 0.0, 0.4, wheel)
+    ser.write(b"K -1 -1\nB 1\nS\n")
+    time.sleep(1.5)
+    return v0, [speed_at(after, t) / v0 if v0 > 0 else float("nan") for t in PROFILE_T]
+
+
+def mean_profile(trials):
+    n = len(trials)
+    return [sum(tr[1][i] for tr in trials) / n for i in range(len(PROFILE_T))]
+
+
+def brake_strength(profile, coast) -> float:
+    """Extra speed lost by 150 ms compared with coasting, as a fraction of the starting speed."""
+    i = PROFILE_T.index(0.15)
+    return coast[i] - profile[i]
+
+
 def brakecal_test(ser: serial.Serial, duty: float, repeats: int):
     fractions = (0.25, 0.5, 0.75, 1.0)
-    print(f"Brake calibration: each wheel spins at {duty * 100:.0f} % throttle, then coasts or brakes at "
-          f"{', '.join(f'{f:.0%}' for f in fractions)} ({repeats}x each). Wheels off the ground! ~{8 * (1 + len(fractions)) * repeats} s")
+    rates = (25, 50, 100, 200, 500)
+    print(f"Brake calibration: each wheel spins at {duty * 100:.0f} % throttle, then coasts or brakes. Part 1: brake "
+          f"25-100 % at 200 Hz pulses; part 2: 50 % brake at {', '.join(map(str, rates))} Hz pulses. Wheels off the "
+          f"ground! ~{int((2 * 5 * repeats + 2 * len(rates)) * 3.5)} s")
     input("Press Enter to start (Ctrl-C stops) ")
     reader = lines(ser)
-    strength = {}
+    head = "  ".join(f"{int(t * 1000):4d}ms" for t in PROFILE_T)
+    full, coast_of = {}, {}
     for wheel, name in enumerate(("left", "right")):
-        print(f"\n{name} wheel:   (slow-down rate: how many times per second the speed drops by e = 2.7x)")
-        rates = {}
+        print(f"\n{name} wheel, part 1: speed (fraction of the start speed) after the throttle drop")
+        print(f"                 start   {head}   extra slowing by 150 ms")
+        prof = {}
         for frac in (0.0,) + fractions:
-            vals = []
-            for _ in range(repeats):
-                ser.write(b"K -1 -1\nB 0\n")
-                d = (duty, 0.0) if wheel == 0 else (0.0, duty)
-                spun = hold(ser, reader, *d, 1.5, wheel)
-                tail = [v for t, v in spun if t > 1.0]
-                v0 = sum(tail) / max(1, len(tail))
-                k = (frac, 0.0) if wheel == 0 else (0.0, frac)
-                ser.write(f"K {k[0]:.2f} {k[1]:.2f}\n".encode())
-                after = hold(ser, reader, 0.0, 0.0, 0.5, wheel)
-                ser.write(b"K -1 -1\nB 1\nS\n")
-                vals.append(decay_rate(after, v0))
-                time.sleep(1.5)
-            ok = [v for v in vals if v == v]
-            rates[frac] = sum(ok) / len(ok) if ok else float("nan")
-            spread = (max(ok) - min(ok)) if len(ok) > 1 else 0.0
-            extra = "" if frac == 0.0 else f"   brake part {rates[frac] - rates[0.0]:5.1f} /s = {(rates[frac] - rates[0.0]) / frac:5.1f} /s per 100 %"
-            print(f"  {'coast' if frac == 0 else f'brake {frac:4.0%}'}: {rates[frac]:5.1f} /s (spread {spread:.1f}){extra}")
-        per_full = [(rates[f] - rates[0.0]) / f for f in fractions if rates[f] == rates[f]]
-        strength[name] = sum(per_full) / len(per_full) if per_full else float("nan")
-        if len(per_full) == len(fractions):
-            lo, hi = per_full[0], per_full[-1]
-            lin = "linear" if abs(lo - hi) < 0.25 * max(lo, hi) else ("weak at small fractions" if lo < hi else "strong at small fractions")
-            print(f"  -> brake strength {strength[name]:.1f} /s at 100 % ({lin})")
-    ser.write(b"K -1 -1\nB 1\nS\n")
-    sl, sr = strength["left"], strength["right"]
-    if sl == sl and sr == sr and sl > 0 and sr > 0:
+            trials = [brake_trial(ser, reader, wheel, duty, frac, 200) for _ in range(repeats)]
+            prof[frac] = mean_profile(trials)
+            v0 = sum(tr[0] for tr in trials) / len(trials)
+            extra = "" if frac == 0.0 else f"   {brake_strength(prof[frac], prof[0.0]):5.2f}"
+            label = "coast" if frac == 0.0 else f"brake {frac:4.0%}"
+            print(f"  {label:10s}: {v0:5.1f}   " + "  ".join(f"{x:6.2f}" for x in prof[frac]) + extra)
+        coast_of[name] = prof[0.0]
+        full[name] = brake_strength(prof[1.0], prof[0.0])
+        print(f"  -> full brake removes {full[name]:.0%} of the speed by 150 ms beyond coasting; "
+              f"ideal for 25/50/75 %: about 1/4, 1/2, 3/4 of that")
+    print("\nPart 2: 50 % brake at different pulse rates (ideal: half of the full brake's extra slowing)")
+    best = {}
+    for wheel, name in enumerate(("left", "right")):
+        for hz in rates:
+            trials = [brake_trial(ser, reader, wheel, duty, 0.5, hz)]
+            st = brake_strength(mean_profile(trials), coast_of[name])
+            ratio = st / full[name] if full[name] > 0 else float("nan")
+            best.setdefault(hz, []).append(ratio)
+            print(f"  {name:5s} {hz:4d} Hz: extra slowing {st:5.2f} = {ratio:4.2f} x full brake")
+    ser.write(b"K -1 -1\nB 1\nF 200\nS\n")
+    score = {hz: abs(sum(r) / len(r) - 0.5) for hz, r in best.items() if all(x == x for x in r)}
+    sl, sr = full["left"], full["right"]
+    print()
+    if score:
+        hz = min(score, key=score.get)
+        print(f"Most proportional pulse rate: {hz} Hz (50 % brake gives {sum(best[hz]) / len(best[hz]):.2f} x full).")
+        print(f"    brake_pwm_hz: {hz}")
+    if sl > 0 and sr > 0:
         weak = min(sl, sr)
-        gl, gr = weak / sl, weak / sr
-        print(f"\nLeft brakes {sl / sr:.2f}x as hard as right. To make them equal, in jetson/config/robot.yaml:")
-        print(f"    brake_gain_left: {gl:.2f}")
-        print(f"    brake_gain_right: {gr:.2f}")
-        print("(or live: ros2 param set /wheel_serial_bridge brake_gain_left ...). Within ~10 % (gains > 0.9) is fine as is.")
+        print(f"Full brake: left {sl:.2f}, right {sr:.2f} (left {sl / sr:.2f}x right). Equal braking:")
+        print(f"    brake_gain_left: {weak / sl:.2f}")
+        print(f"    brake_gain_right: {weak / sr:.2f}")
+        print("Put these in jetson/config/robot.yaml (wheel_serial_bridge). Within ~10 % (gains > 0.9) is fine as is.")
     else:
-        print("\nNo usable measurement: did the wheels spin up? Is the brake wired (motor_test.py brake)?")
+        print("No usable full-brake measurement: did the wheels spin up? Is the brake wired (motor_test.py brake)?")
+    print("Paste this output to Claude.")
 
 
 def main():

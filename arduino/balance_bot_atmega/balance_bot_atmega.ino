@@ -12,6 +12,7 @@
 //                   "G <kp> <ki>\n"        set the velocity loop gains (kp in duty per rad/s, ki in duty per rad)
 //                   "B <0|1> [min]\n"      automatic braking off / on (default on, see "Brake"), optionally from
 //                                         which wheel speed [rad/s] on (default 3)
+//                   "F <hz>\n"             BRAKE pulse rate (default 200)
 //                   "J <left> <right>\n"   brake gains 0-1 (automatic braking x gain; motor_test.py brakecal)
 //                   "K <left> <right>\n"   brake test: brake strength 0-1 on each wheel while V / D commands keep
 //                                         coming (negative = automatic again)
@@ -81,14 +82,14 @@ const uint8_t LEFT_DIR_PIN = 7;
 #endif
 // Brake: the ZS-X11H BRAKE input of channel 1 (throttle D9) on A4, channel 2 (D10) on A5 (SWAP_BRAKE_PINS 1: the
 // other way round). The drivers do not brake when the throttle drops (the wheel freewheels), so the firmware does:
-// when the throttle asks for less speed than the wheel is turning, BRAKE is pulsed (BRAKE_PWM_HZ) with the fraction
+// when the throttle asks for less speed than the wheel is turning, BRAKE is pulsed ("F", default 200 Hz) with the fraction
 // 1 - throttle speed / wheel speed and the throttle off. Shorting the motor brakes with a torque proportional to its
 // speed, so on average this gives the same torque as a driver that brakes back down to the throttle's speed (what
 // the training's motor model assumes). Throttle 0 (stop, timeout, tilt cut-off, a reversal waiting for the wheel to
 // slow down) still coasts, as in training. Released = pin high-impedance (as when the brake was not used).
 #define SWAP_BRAKE_PINS 0
 const bool BRAKE_ACTIVE_HIGH = true;   // BRAKE level that brakes (motor_test.py brake checks it)
-const float BRAKE_PWM_HZ = 200.0f;
+float brakePwmHz = 200.0f;            // BRAKE pulse rate ("F <hz>"; motor_test.py brakecal compares rates)
 const float BRAKE_MAX = 1.0f;          // strongest brake fraction
 // no braking below this wheel speed: there the firmware may reverse (REVERSE_MAX_RAD_S), and braking the two wheels
 // separately while balancing on the spot turned the robot (the motors and speed pulses differ). "B 1 <rad/s>" sets it
@@ -486,7 +487,7 @@ void applyBrake(Wheel& w) {
 
 // pulse each BRAKE pin with its fraction; called every loop() pass
 void serviceBrakes(uint32_t nowUs) {
-  const uint32_t periodUs = (uint32_t)(1e6f / BRAKE_PWM_HZ);
+  const uint32_t periodUs = (uint32_t)(1e6f / brakePwmHz);
   uint32_t phase = nowUs % periodUs;
   for (Wheel* w : wheels) setBrakePin(*w, w->brake > 0.0f && phase < (uint32_t)(w->brake * periodUs));
 }
@@ -624,6 +625,12 @@ void handleLine(char* line) {
       Serial.print(F(" above "));
       Serial.print(brakeMinRadS, 1);
       Serial.println(F(" rad/s"));
+      break;
+    case 'F':
+      brakePwmHz = constrain(atof(line + 1), 5.0f, 2000.0f);
+      Serial.print(F("# brake pulse rate "));
+      Serial.print(brakePwmHz, 0);
+      Serial.println(F(" Hz"));
       break;
     case 'J':
       if (parseTwo(line + 1, a, b)) {
