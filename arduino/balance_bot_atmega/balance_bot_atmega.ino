@@ -10,7 +10,8 @@
 //                   "S\n"                  stop: throttle 0 (wheels coast) until the next V / D
 //                   "D <left> <right>\n"   open-loop test: raw duty in [-1, 1], no speed loop (wheels lifted!)
 //                   "G <kp> <ki>\n"        set the velocity loop gains (kp in duty per rad/s, ki in duty per rad)
-//                   "B <0|1>\n"            automatic braking off / on (default on, see "Brake")
+//                   "B <0|1> [min]\n"      automatic braking off / on (default on, see "Brake"), optionally from
+//                                         which wheel speed [rad/s] on (default 3)
 //                   "K <left> <right>\n"   brake test: brake strength 0-1 on each wheel while V / D commands keep
 //                                         coming (negative = automatic again)
 //                   "?\n"                  print the configuration, hall counts and hall errors
@@ -88,7 +89,9 @@ const uint8_t LEFT_DIR_PIN = 7;
 const bool BRAKE_ACTIVE_HIGH = true;   // BRAKE level that brakes (motor_test.py brake checks it)
 const float BRAKE_PWM_HZ = 200.0f;
 const float BRAKE_MAX = 1.0f;          // strongest brake fraction
-const float BRAKE_MIN_RAD_S = 1.0f;    // no braking below this wheel speed (the speed pulses are too coarse)
+// no braking below this wheel speed: there the firmware may reverse (REVERSE_MAX_RAD_S), and braking the two wheels
+// separately while balancing on the spot turned the robot (the motors and speed pulses differ). "B 1 <rad/s>" sets it
+float brakeMinRadS = 3.0f;
 const uint8_t CH1_BRAKE_PIN = SWAP_BRAKE_PINS ? A5 : A4;
 const uint8_t CH2_BRAKE_PIN = SWAP_BRAKE_PINS ? A4 : A5;
 const uint8_t LEFT_BRAKE_PIN = SWAP_LEFT_RIGHT ? CH1_BRAKE_PIN : CH2_BRAKE_PIN;
@@ -468,7 +471,7 @@ float brakeFraction(Wheel& w) {
   if (w.manualBrake >= 0.0f) return min(w.manualBrake, 1.0f);
   if (!autoBrake || w.appliedDuty == 0.0f) return 0.0f;
   float speed = w.velocity * w.dirSign;  // wheel speed in the direction the throttle pushes
-  if (speed < BRAKE_MIN_RAD_S) return 0.0f;
+  if (speed < brakeMinRadS) return 0.0f;
   float throttleSpeed = fabs(w.appliedDuty) * MOTOR_MAX_RAD_S;
   if (throttleSpeed >= speed) return 0.0f;
   return min(1.0f - throttleSpeed / speed, BRAKE_MAX);
@@ -546,7 +549,10 @@ void printConfig() {
   Serial.print(RIGHT_BRAKE_PIN - A0);
   Serial.print(BRAKE_ACTIVE_HIGH ? F(" active high") : F(" active low"));
   Serial.print(F(", auto "));
-  Serial.println(autoBrake ? F("on") : F("off"));
+  Serial.print(autoBrake ? F("on") : F("off"));
+  Serial.print(F(" above "));
+  Serial.print(brakeMinRadS, 1);
+  Serial.println(F(" rad/s"));
   for (Wheel* w : wheels) {
     noInterrupts();
     int32_t count = w->count;
@@ -605,9 +611,17 @@ void handleLine(char* line) {
       Serial.println(KI, 4);
       break;
     case 'B':
-      autoBrake = atof(line + 1) != 0.0f;
+      if (parseTwo(line + 1, a, b)) {
+        autoBrake = a != 0.0f;
+        brakeMinRadS = max(b, 0.0f);
+      } else {
+        autoBrake = atof(line + 1) != 0.0f;
+      }
       Serial.print(F("# auto brake "));
-      Serial.println(autoBrake ? F("on") : F("off"));
+      Serial.print(autoBrake ? F("on") : F("off"));
+      Serial.print(F(" above "));
+      Serial.print(brakeMinRadS, 1);
+      Serial.println(F(" rad/s"));
       break;
     case 'K':
       if (parseTwo(line + 1, a, b)) {
