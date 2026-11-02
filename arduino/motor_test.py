@@ -10,11 +10,14 @@ Wheels off the ground, drivers powered (36 V), sketch flashed, Arduino IDE's Ser
     python3 arduino/motor_test.py loop   /dev/ttyUSB0    # speed loop: targets 5, 15, -5, 0 rad/s, target vs measured
     python3 arduino/motor_test.py brake  /dev/ttyUSB0    # BRAKE wiring (A4 / A5): which pin brakes which wheel,
                                                          # polarity, and the automatic braking
+    python3 arduino/motor_test.py brakecal /dev/ttyUSB0  # brake strength of each wheel at 25-100 %: gains that
+                                                         # make both wheels brake the same
 
 Needs pyserial (sudo apt install python3-serial). Ctrl-C stops (the motors switch off).
 """
 
 import argparse
+import math
 import re
 import sys
 import time
@@ -248,9 +251,73 @@ def brake_test(ser: serial.Serial, duty: float):
     print("\nThe automatic line should slow the wheel about as fast as the brake pin line (to the lower throttle's speed).")
 
 
+def decay_rate(samples: list[tuple[float, float]], v0: float) -> float:
+    """Exponential slow-down rate [1/s] (shorted motor: torque ~ speed, so v ~ exp(-rate t)) from ln(v) vs t."""
+    pts = [(t, v) for t, v in samples if 0.02 <= t and v > max(3.0, 0.15 * v0)]
+    if len(pts) < 3:
+        pts = [(t, v) for t, v in samples if 0.0 <= t <= 0.1 and v > 0.5]
+    if len(pts) < 2:
+        return float("nan")
+    n = len(pts)
+    mt = sum(t for t, _ in pts) / n
+    ml = sum(math.log(v) for _, v in pts) / n
+    num = sum((t - mt) * (math.log(v) - ml) for t, v in pts)
+    den = sum((t - mt) ** 2 for t, _ in pts)
+    return -num / den if den > 0 else float("nan")
+
+
+def brakecal_test(ser: serial.Serial, duty: float, repeats: int):
+    fractions = (0.25, 0.5, 0.75, 1.0)
+    print(f"Brake calibration: each wheel spins at {duty * 100:.0f} % throttle, then coasts or brakes at "
+          f"{', '.join(f'{f:.0%}' for f in fractions)} ({repeats}x each). Wheels off the ground! ~{8 * (1 + len(fractions)) * repeats} s")
+    input("Press Enter to start (Ctrl-C stops) ")
+    reader = lines(ser)
+    strength = {}
+    for wheel, name in enumerate(("left", "right")):
+        print(f"\n{name} wheel:   (slow-down rate: how many times per second the speed drops by e = 2.7x)")
+        rates = {}
+        for frac in (0.0,) + fractions:
+            vals = []
+            for _ in range(repeats):
+                ser.write(b"K -1 -1\nB 0\n")
+                d = (duty, 0.0) if wheel == 0 else (0.0, duty)
+                spun = hold(ser, reader, *d, 1.5, wheel)
+                tail = [v for t, v in spun if t > 1.0]
+                v0 = sum(tail) / max(1, len(tail))
+                k = (frac, 0.0) if wheel == 0 else (0.0, frac)
+                ser.write(f"K {k[0]:.2f} {k[1]:.2f}\n".encode())
+                after = hold(ser, reader, 0.0, 0.0, 0.5, wheel)
+                ser.write(b"K -1 -1\nB 1\nS\n")
+                vals.append(decay_rate(after, v0))
+                time.sleep(1.5)
+            ok = [v for v in vals if v == v]
+            rates[frac] = sum(ok) / len(ok) if ok else float("nan")
+            spread = (max(ok) - min(ok)) if len(ok) > 1 else 0.0
+            extra = "" if frac == 0.0 else f"   brake part {rates[frac] - rates[0.0]:5.1f} /s = {(rates[frac] - rates[0.0]) / frac:5.1f} /s per 100 %"
+            print(f"  {'coast' if frac == 0 else f'brake {frac:4.0%}'}: {rates[frac]:5.1f} /s (spread {spread:.1f}){extra}")
+        per_full = [(rates[f] - rates[0.0]) / f for f in fractions if rates[f] == rates[f]]
+        strength[name] = sum(per_full) / len(per_full) if per_full else float("nan")
+        if len(per_full) == len(fractions):
+            lo, hi = per_full[0], per_full[-1]
+            lin = "linear" if abs(lo - hi) < 0.25 * max(lo, hi) else ("weak at small fractions" if lo < hi else "strong at small fractions")
+            print(f"  -> brake strength {strength[name]:.1f} /s at 100 % ({lin})")
+    ser.write(b"K -1 -1\nB 1\nS\n")
+    sl, sr = strength["left"], strength["right"]
+    if sl == sl and sr == sr and sl > 0 and sr > 0:
+        weak = min(sl, sr)
+        gl, gr = weak / sl, weak / sr
+        print(f"\nLeft brakes {sl / sr:.2f}x as hard as right. To make them equal, in jetson/config/robot.yaml:")
+        print(f"    brake_gain_left: {gl:.2f}")
+        print(f"    brake_gain_right: {gr:.2f}")
+        print("(or live: ros2 param set /wheel_serial_bridge brake_gain_left ...). Within ~10 % (gains > 0.9) is fine as is.")
+    else:
+        print("\nNo usable measurement: did the wheels spin up? Is the brake wired (motor_test.py brake)?")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("test", choices=("counts", "speed", "run", "loop", "brake"))
+    ap.add_argument("test", choices=("counts", "speed", "run", "loop", "brake", "brakecal"))
+    ap.add_argument("--repeats", type=int, default=2, help="brakecal: runs per brake strength")
     ap.add_argument("port", help="e.g. /dev/ttyUSB0 or /dev/ttyACM0")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--duty", type=float, default=None,
@@ -270,6 +337,8 @@ def main():
             run_test(ser, 0.02 if args.duty is None else args.duty, args.seconds, args.wheel)
         elif args.test == "brake":
             brake_test(ser, 0.3 if args.duty is None else args.duty)
+        elif args.test == "brakecal":
+            brakecal_test(ser, 0.3 if args.duty is None else args.duty, args.repeats)
         else:
             loop_test(ser, args.targets, args.step_seconds)
     except KeyboardInterrupt:

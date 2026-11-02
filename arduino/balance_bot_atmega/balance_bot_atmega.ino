@@ -12,6 +12,7 @@
 //                   "G <kp> <ki>\n"        set the velocity loop gains (kp in duty per rad/s, ki in duty per rad)
 //                   "B <0|1> [min]\n"      automatic braking off / on (default on, see "Brake"), optionally from
 //                                         which wheel speed [rad/s] on (default 3)
+//                   "J <left> <right>\n"   brake gains 0-1 (automatic braking x gain; motor_test.py brakecal)
 //                   "K <left> <right>\n"   brake test: brake strength 0-1 on each wheel while V / D commands keep
 //                                         coming (negative = automatic again)
 //                   "?\n"                  print the configuration, hall counts and hall errors
@@ -227,6 +228,7 @@ struct Wheel {
   uint8_t brakePin;     // set in setup()
   float brake;          // brake fraction 0-1 currently applied (pulsed by serviceBrakes)
   float manualBrake;    // "K" test value, < 0 = automatic
+  float brakeGain;      // automatic braking scaled by this (0-1): matches the two wheels' brakes ("J", motor_test brakecal)
   bool brakeOn;         // BRAKE pin state right now
 };
 
@@ -474,7 +476,7 @@ float brakeFraction(Wheel& w) {
   if (speed < brakeMinRadS) return 0.0f;
   float throttleSpeed = fabs(w.appliedDuty) * MOTOR_MAX_RAD_S;
   if (throttleSpeed >= speed) return 0.0f;
-  return min(1.0f - throttleSpeed / speed, BRAKE_MAX);
+  return min(w.brakeGain * (1.0f - throttleSpeed / speed), BRAKE_MAX);
 }
 
 void applyBrake(Wheel& w) {
@@ -623,6 +625,16 @@ void handleLine(char* line) {
       Serial.print(brakeMinRadS, 1);
       Serial.println(F(" rad/s"));
       break;
+    case 'J':
+      if (parseTwo(line + 1, a, b)) {
+        leftWheel.brakeGain = constrain(a, 0.0f, 1.0f);
+        rightWheel.brakeGain = constrain(b, 0.0f, 1.0f);
+      }
+      Serial.print(F("# brake gain left "));
+      Serial.print(leftWheel.brakeGain, 3);
+      Serial.print(F(" right "));
+      Serial.println(rightWheel.brakeGain, 3);
+      break;
     case 'K':
       if (parseTwo(line + 1, a, b)) {
         leftWheel.manualBrake = a;
@@ -690,6 +702,7 @@ void setup() {
   rightWheel.brakePin = RIGHT_BRAKE_PIN;
   for (Wheel* w : wheels) {
     w->manualBrake = -1.0f;
+    w->brakeGain = 1.0f;
     w->brakeOn = true;
     setBrakePin(*w, false);
   }
