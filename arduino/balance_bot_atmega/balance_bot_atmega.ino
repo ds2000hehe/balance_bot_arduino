@@ -1,7 +1,7 @@
 // Balance bot wheel controller for an ATmega328P board (Arduino Uno / Nano, 16 MHz, Arduino IDE board "Arduino Uno"
 // or "Arduino Nano") driving two hoverboard hub motors through ZS-X11H BLDC drivers (36 V) with PWM throttle +
-// DIR only. The drivers' BRAKE and STOP inputs are not used: tie them (or leave them) at the level that lets the
-// motor run.
+// DIR, plus the drivers' BRAKE inputs on A4 / A5 (see "Brake" below). STOP inputs are not used: tie them (or leave
+// them) at the level that lets the motor run.
 //
 // Same serial protocol as the ESP32 version (arduino/esp32_legacy/balance_bot_esp32), so the ROS bridge, wheel_check and the
 // policy work unchanged:
@@ -10,6 +10,9 @@
 //                   "S\n"                  stop: throttle 0 (wheels coast) until the next V / D
 //                   "D <left> <right>\n"   open-loop test: raw duty in [-1, 1], no speed loop (wheels lifted!)
 //                   "G <kp> <ki>\n"        set the velocity loop gains (kp in duty per rad/s, ki in duty per rad)
+//                   "B <0|1>\n"            automatic braking off / on (default on, see "Brake")
+//                   "K <left> <right>\n"   brake test: brake strength 0-1 on each wheel while V / D commands keep
+//                                         coming (negative = automatic again)
 //                   "?\n"                  print the configuration, hall counts and hall errors
 //   Arduino -> PC   "W <left> <right>\n"   measured wheel speeds [rad/s] at REPORT_HZ, positive = forward
 //                   "# ...\n"              information lines (ignored by the ROS bridge, shown in its log)
@@ -74,6 +77,24 @@ const uint8_t LEFT_DIR_PIN = 6;
 const uint8_t RIGHT_DIR_PIN = 6;
 const uint8_t LEFT_DIR_PIN = 7;
 #endif
+// Brake: the ZS-X11H BRAKE input of channel 1 (throttle D9) on A4, channel 2 (D10) on A5 (SWAP_BRAKE_PINS 1: the
+// other way round). The drivers do not brake when the throttle drops (the wheel freewheels), so the firmware does:
+// when the throttle asks for less speed than the wheel is turning, BRAKE is pulsed (BRAKE_PWM_HZ) with the fraction
+// 1 - throttle speed / wheel speed and the throttle off. Shorting the motor brakes with a torque proportional to its
+// speed, so on average this gives the same torque as a driver that brakes back down to the throttle's speed (what
+// the training's motor model assumes). Throttle 0 (stop, timeout, tilt cut-off, a reversal waiting for the wheel to
+// slow down) still coasts, as in training. Released = pin high-impedance (as when the brake was not used).
+#define SWAP_BRAKE_PINS 0
+const bool BRAKE_ACTIVE_HIGH = true;   // BRAKE level that brakes (motor_test.py brake checks it)
+const float BRAKE_PWM_HZ = 200.0f;
+const float BRAKE_MAX = 1.0f;          // strongest brake fraction
+const float BRAKE_MIN_RAD_S = 1.0f;    // no braking below this wheel speed (the speed pulses are too coarse)
+const uint8_t CH1_BRAKE_PIN = SWAP_BRAKE_PINS ? A5 : A4;
+const uint8_t CH2_BRAKE_PIN = SWAP_BRAKE_PINS ? A4 : A5;
+const uint8_t LEFT_BRAKE_PIN = SWAP_LEFT_RIGHT ? CH1_BRAKE_PIN : CH2_BRAKE_PIN;
+const uint8_t RIGHT_BRAKE_PIN = SWAP_LEFT_RIGHT ? CH2_BRAKE_PIN : CH1_BRAKE_PIN;
+bool autoBrake = true;
+
 // Throttle: right = D9, left = D10 on both supported boards (fixed, see setupPwm()). The chip is detected when
 // compiling (pick the board in the IDE / --fqbn):
 //   ATmega328P (Uno / Nano):       D9 / D10 = Timer1 OC1A / OC1B, 10-bit PWM
@@ -199,6 +220,11 @@ struct Wheel {
   float appliedDuty;    // what actually goes to the driver, after the output protection, [-1, 1]
   int8_t dirSign;       // direction DIR currently selects: +1 forward, -1 backward
   uint32_t dirChangeMs; // when DIR last changed
+
+  uint8_t brakePin;     // set in setup()
+  float brake;          // brake fraction 0-1 currently applied (pulsed by serviceBrakes)
+  float manualBrake;    // "K" test value, < 0 = automatic
+  bool brakeOn;         // BRAKE pin state right now
 };
 
 // timer compare channel of each throttle pin: D9 = OC2B (Mega) / OC1A (Uno), D10 = OC2A / OC1B
@@ -257,6 +283,9 @@ inline void hallEdge(Wheel& w, uint8_t state, uint32_t nowUs) {
 
 #if FEEDBACK == FEEDBACK_HALLS && SWAP_LEFT_RIGHT
 #error "SWAP_LEFT_RIGHT does not swap the hall inputs: swap the hall wires (A0-A2 <-> A3-A5) instead"
+#endif
+#if FEEDBACK == FEEDBACK_HALLS
+#error "FEEDBACK_HALLS reads A0-A5, but A4 / A5 are the BRAKE outputs: move the brakes to other pins first"
 #endif
 #if FEEDBACK == FEEDBACK_HALLS && defined(__AVR_ATmega2560__)
 #error "FEEDBACK_HALLS reads A0-A5 through port C: ATmega328P only. Use FEEDBACK_SPEED_PULSE on the Mega."
@@ -419,17 +448,57 @@ bool driveMotor(Wheel& w, float duty, float dt) {
   return limited;
 }
 
+// ---- brake ----
+
+void setBrakePin(Wheel& w, bool on) {
+  if (on == w.brakeOn) return;
+  w.brakeOn = on;
+  if (on) {
+    digitalWrite(w.brakePin, BRAKE_ACTIVE_HIGH ? HIGH : LOW);
+    pinMode(w.brakePin, OUTPUT);
+  } else {
+    pinMode(w.brakePin, INPUT);  // released: high-impedance, no pull-up
+    digitalWrite(w.brakePin, LOW);
+  }
+}
+
+// brake fraction for this control step (see "Brake" at the top)
+float brakeFraction(Wheel& w) {
+  if (mode == MODE_OFF) return 0.0f;
+  if (w.manualBrake >= 0.0f) return min(w.manualBrake, 1.0f);
+  if (!autoBrake || w.appliedDuty == 0.0f) return 0.0f;
+  float speed = w.velocity * w.dirSign;  // wheel speed in the direction the throttle pushes
+  if (speed < BRAKE_MIN_RAD_S) return 0.0f;
+  float throttleSpeed = fabs(w.appliedDuty) * MOTOR_MAX_RAD_S;
+  if (throttleSpeed >= speed) return 0.0f;
+  return min(1.0f - throttleSpeed / speed, BRAKE_MAX);
+}
+
+void applyBrake(Wheel& w) {
+  w.brake = brakeFraction(w);
+  if (w.brake > 0.0f) writePwm(w, 0);  // throttle off while braking (appliedDuty is kept for the throttle ramp)
+}
+
+// pulse each BRAKE pin with its fraction; called every loop() pass
+void serviceBrakes(uint32_t nowUs) {
+  const uint32_t periodUs = (uint32_t)(1e6f / BRAKE_PWM_HZ);
+  uint32_t phase = nowUs % periodUs;
+  for (Wheel* w : wheels) setBrakePin(*w, w->brake > 0.0f && phase < (uint32_t)(w->brake * periodUs));
+}
+
 // ---- velocity loop ----
 
 void controlWheel(Wheel& w, float dt) {
   if (mode == MODE_OFF) {
     w.integral = 0.0f;
     stopMotor(w);
+    applyBrake(w);
     return;
   }
   if (mode == MODE_OPEN_LOOP) {
     w.integral = 0.0f;
     driveMotor(w, w.duty, dt);
+    applyBrake(w);
     return;
   }
   float error = w.target - w.velocity;
@@ -439,6 +508,7 @@ void controlWheel(Wheel& w, float dt) {
   // anti-windup: hold the integral while saturated in the direction of the error
   bool saturated = (duty >= 1.0f && error > 0.0f) || (duty <= -1.0f && error < 0.0f);
   bool limited = driveMotor(w, duty, dt);
+  applyBrake(w);
   if (!saturated && !limited) w.integral += error * dt;
 }
 
@@ -470,6 +540,13 @@ void printConfig() {
   Serial.print(F(" Hz, timeout "));
   Serial.print(CMD_TIMEOUT_MS);
   Serial.println(F(" ms"));
+  Serial.print(F("# brake left A"));
+  Serial.print(LEFT_BRAKE_PIN - A0);
+  Serial.print(F(" / right A"));
+  Serial.print(RIGHT_BRAKE_PIN - A0);
+  Serial.print(BRAKE_ACTIVE_HIGH ? F(" active high") : F(" active low"));
+  Serial.print(F(", auto "));
+  Serial.println(autoBrake ? F("on") : F("off"));
   for (Wheel* w : wheels) {
     noInterrupts();
     int32_t count = w->count;
@@ -527,6 +604,21 @@ void handleLine(char* line) {
       Serial.print(F(" ki "));
       Serial.println(KI, 4);
       break;
+    case 'B':
+      autoBrake = atof(line + 1) != 0.0f;
+      Serial.print(F("# auto brake "));
+      Serial.println(autoBrake ? F("on") : F("off"));
+      break;
+    case 'K':
+      if (parseTwo(line + 1, a, b)) {
+        leftWheel.manualBrake = a;
+        rightWheel.manualBrake = b;
+      }
+      Serial.print(F("# brake test left "));
+      Serial.print(leftWheel.manualBrake, 2);
+      Serial.print(F(" right "));
+      Serial.println(rightWheel.manualBrake, 2);
+      break;
     case '?':
       printConfig();
       break;
@@ -580,6 +672,13 @@ void setupFeedback() {
 }
 
 void setup() {
+  leftWheel.brakePin = LEFT_BRAKE_PIN;
+  rightWheel.brakePin = RIGHT_BRAKE_PIN;
+  for (Wheel* w : wheels) {
+    w->manualBrake = -1.0f;
+    w->brakeOn = true;
+    setBrakePin(*w, false);
+  }
   pinMode(LEFT_DIR_PIN, OUTPUT);
   pinMode(RIGHT_DIR_PIN, OUTPUT);
   setupPwm();
@@ -605,6 +704,7 @@ void loop() {
   }
 
   uint32_t now = micros();
+  serviceBrakes(now);
   if (now - lastControlUs >= controlPeriodUs) {
     lastControlUs += controlPeriodUs;
     if (now - lastControlUs > 10 * controlPeriodUs) lastControlUs = now;  // fell far behind: resync

@@ -8,6 +8,8 @@ Wheels off the ground, drivers powered (36 V), sketch flashed, Arduino IDE's Ser
     python3 arduino/motor_test.py run    /dev/ttyUSB0 --duty 0.02 --seconds 1 --wheel left
                                                          # fixed throttle (here 2 %) for a while, prints the speed
     python3 arduino/motor_test.py loop   /dev/ttyUSB0    # speed loop: targets 5, 15, -5, 0 rad/s, target vs measured
+    python3 arduino/motor_test.py brake  /dev/ttyUSB0    # BRAKE wiring (A4 / A5): which pin brakes which wheel,
+                                                         # polarity, and the automatic braking
 
 Needs pyserial (sudo apt install python3-serial). Ctrl-C stops (the motors switch off).
 """
@@ -182,12 +184,77 @@ def loop_test(ser: serial.Serial, targets: list[float], seconds: float):
     print("Means within ~10 % of the target (0 at 0) and small spread = good. Way off or wildly swinging: tell Claude.")
 
 
+def hold(ser: serial.Serial, reader, left: float, right: float, seconds: float, wheel: int) -> list[tuple[float, float]]:
+    """Send "D left right" every 20 ms for a while; return (t, |speed|) of one wheel (0 = left, 1 = right)."""
+    out, t0 = [], time.time()
+    while time.time() - t0 < seconds:
+        ser.write(f"D {left:.3f} {right:.3f}\n".encode())
+        t_send = time.time()
+        while time.time() - t_send < 0.02:
+            line = next(reader)
+            m = line and re.match(r"W (-?[\d.]+) (-?[\d.]+)", line)
+            if m:
+                out.append((time.time() - t0, abs(float(m.group(1 + wheel)))))
+    return out
+
+
+def slowdown(samples: list[tuple[float, float]], v0: float) -> tuple[float, float]:
+    """Speed after 0.3 s and time to fall to half of v0."""
+    at = [v for t, v in samples if t >= 0.3]
+    half = next((t for t, v in samples if v <= 0.5 * v0), float("nan"))
+    return (at[0] if at else float("nan")), half
+
+
+def brake_test(ser: serial.Serial, duty: float):
+    print(f"BRAKE wiring check: each wheel spins at {duty * 100:.0f} % throttle, then the throttle drops and the wheel")
+    print("either coasts or is braked. Wheels off the ground!")
+    input("Press Enter to start (Ctrl-C stops) ")
+    reader = lines(ser)
+    for wheel, name in enumerate(("left", "right")):
+        trials = [("coast (no brake)", "B 0", "K -1 -1", 0.0),
+                  ("brake pin of this wheel", "B 0", "K 1 0" if wheel == 0 else "K 0 1", 0.0),
+                  ("brake pin of the OTHER wheel", "B 0", "K 0 1" if wheel == 0 else "K 1 0", 0.0),
+                  (f"automatic (throttle to {duty / 4 * 100:.1f} %)", "B 1", "K -1 -1", duty / 4)]
+        print(f"\n{name} wheel:")
+        result = {}
+        for label, auto, manual, low in trials:
+            ser.write(b"K -1 -1\nB 0\n")
+            d = (duty, 0.0) if wheel == 0 else (0.0, duty)
+            spun = hold(ser, reader, *d, 1.5, wheel)
+            v0 = sum(v for t, v in spun if t > 1.0) / max(1, sum(1 for t, v in spun if t > 1.0))
+            ser.write(f"{auto}\n{manual}\n".encode())
+            d = (low, 0.0) if wheel == 0 else (0.0, low)
+            after = hold(ser, reader, *d, 1.2, wheel)
+            ser.write(b"K -1 -1\nB 1\nS\n")
+            v03, half = slowdown(after, v0)
+            result[label] = half
+            print(f"  {label:34s}: {v0:5.1f} rad/s -> {v03:5.1f} after 0.3 s, half speed after "
+                  + (f"{half * 1000:4.0f} ms" if half == half else "  > 1.2 s"))
+            time.sleep(2.0)  # coast to a stop
+        if v0 < 2.0:
+            print(f"  -> the {name} wheel did not spin up (driver powered? try a higher --duty)")
+            continue
+        coast, own, other = (result[k] for k in list(result)[:3])
+        def faster(x):  # clearly faster than coasting
+            return x == x and (coast != coast or x < 0.5 * coast)
+        if faster(own):
+            print(f"  -> {name} brake works, pin and polarity right")
+        elif faster(other):
+            print(f"  -> the other wheel's pin brakes this wheel: set SWAP_BRAKE_PINS to 1 in the sketch")
+        else:
+            print("  -> no braking from either pin: flip BRAKE_ACTIVE_HIGH in the sketch and run again; still nothing:"
+                  " check the BRAKE wires (and that they share GND with the Arduino)")
+    ser.write(b"K -1 -1\nB 1\nS\n")
+    print("\nThe automatic line should slow the wheel about as fast as the brake pin line (to the lower throttle's speed).")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("test", choices=("counts", "speed", "run", "loop"))
+    ap.add_argument("test", choices=("counts", "speed", "run", "loop", "brake"))
     ap.add_argument("port", help="e.g. /dev/ttyUSB0 or /dev/ttyACM0")
     ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--duty", type=float, default=0.02, help="run: throttle fraction, 0.02 = 2 %%, negative = backward")
+    ap.add_argument("--duty", type=float, default=None,
+                    help="run: throttle fraction, 0.02 = 2 %% (default), negative = backward; brake: spin throttle (0.3)")
     ap.add_argument("--seconds", type=float, default=1.0, help="run: how long (default 1 s)")
     ap.add_argument("--targets", type=float, nargs="+", default=[5, 15, -5, 0], help="loop: speeds in rad/s")
     ap.add_argument("--step-seconds", type=float, default=2.0, help="loop: seconds per target")
@@ -200,7 +267,9 @@ def main():
         elif args.test == "speed":
             speed_test(ser)
         elif args.test == "run":
-            run_test(ser, args.duty, args.seconds, args.wheel)
+            run_test(ser, 0.02 if args.duty is None else args.duty, args.seconds, args.wheel)
+        elif args.test == "brake":
+            brake_test(ser, 0.3 if args.duty is None else args.duty)
         else:
             loop_test(ser, args.targets, args.step_seconds)
     except KeyboardInterrupt:
