@@ -146,16 +146,20 @@ const float MIN_DUTY = 0.0f;
 const float DUTY_SLEW_PER_S = 4.0f;     // 0 -> 100 % in 0.25 s, 0 -> 30 % in 75 ms
 const float REVERSE_MAX_RAD_S = 100.0f; // no block: reversing brakes hard at any speed (reverse_test 2026-11-02: half
                                         // speed in 13-31 ms from 20 rad/s vs 220-250 ms coasting). Was 3 (~0.25 m/s)
-const uint32_t DIR_MIN_HOLD_MS = 30;
+const uint32_t DIR_MIN_HOLD_MS = 10;  // was 30: reversal (= braking) starts sooner
 // Braking by reversal (raw duty "D" mode only). The ZS-X11H coasts when the throttle drops but brakes hard when
 // reversed (reverse_test). When a wheel turns more than REVERSE_BRAKE_MARGIN faster than the throttle asks for, it is
 // reversed with REVERSE_BRAKE_GAIN * excess / MOTOR_MAX_RAD_S (at most REVERSE_BRAKE_MAX) until it is down to the
 // throttle's speed. Same as the training's drive model (reverse_brake): policies trained with it (smooth21) need it.
 const bool REVERSE_BRAKE = true;
-const float REVERSE_BRAKE_MARGIN = 5.0f;  // rad/s
+const float REVERSE_BRAKE_MARGIN = 1.5f;  // rad/s (was 5: dead zone, robot tipped back to -17 deg, then a jolt)
 const float REVERSE_BRAKE_GAIN = 0.5f;
 const float REVERSE_BRAKE_MAX = 0.08f;    // duty
 const float REVERSE_BRAKE_MIN = 1.5f;     // rad/s, no braking below (coarse speed pulses)
+// pulsed braking: the drivers brake about equally hard at any reverse throttle, so the strength is set by the time
+// reversed: REVERSE_BRAKE_MAX for (strength / REVERSE_BRAKE_MAX) of each REVERSE_BRAKE_PULSE_MS, coasting the rest
+// (DIR stays reversed, throttle 0). 0 = continuous
+const uint32_t REVERSE_BRAKE_PULSE_MS = 40;
 
 // Throttle PWM frequency: 0 = 15.6 kHz (default), 1 = 1.95 kHz. Both 10-bit. ZS-X11H boards are usually specified
 // for ~1-20 kHz; if the motor does not respond smoothly to "D 0.1 0.1" .. "D 0.5 0.5", try the other one.
@@ -444,6 +448,11 @@ float reverseBrake(Wheel& w, float duty) {
   w.braking = start || keep;
   if (!w.braking) return duty;
   float brake = constrain(REVERSE_BRAKE_GAIN * excess / MOTOR_MAX_RAD_S, 0.0f, REVERSE_BRAKE_MAX);
+  if (REVERSE_BRAKE_PULSE_MS > 0) {
+    float phase = (float)(millis() % REVERSE_BRAKE_PULSE_MS) / REVERSE_BRAKE_PULSE_MS;
+    // off phase: a tiny reverse duty keeps DIR reversed with the throttle at 0 (coast, no DIR chatter)
+    return phase < brake / REVERSE_BRAKE_MAX ? -w.brakeDir * REVERSE_BRAKE_MAX : -w.brakeDir * 1e-6f;
+  }
   return -w.brakeDir * brake;
 }
 
